@@ -104,13 +104,20 @@ function makeWav(seconds, freq) {
   ok((await page.locator('#diffTbody tr').first().innerHTML()).includes('→'), '显示修改前 → 后');
   await page.locator('#btnDiffApply').click();
   await page.waitForTimeout(300);
+  // 自动顺延只修复时间类问题；分行（超长行等）不在其职责内，不断言全部清零
+  const remainTiming = await page.$$eval('#problemList li', lis =>
+    lis.filter(li => /语速|过短|间隔|重叠|时序/.test(li.querySelector('.badge').textContent)).length);
+  ok(remainTiming === 0, '顺延应用后时间类节奏问题清零（剩余 ' + remainTiming + '）');
   const afterSummary = await page.locator('#problemSummary').textContent();
-  ok(afterSummary.includes('未发现问题'), '顺延应用后问题清零：' + afterSummary.trim());
-  // 撤销顺延应恢复问题
+  ok(/未发现问题|共 \d+ 个问题/.test(afterSummary), '问题汇总正常：' + afterSummary.trim());
+  // 撤销顺延应恢复时间类问题
   await page.keyboard.press('Control+z');
   await page.waitForTimeout(200);
   const backSummary = await page.locator('#problemSummary').textContent();
-  ok(/共 \d+ 个问题/.test(backSummary), '撤销顺延后问题恢复');
+  const backTiming = await page.$$eval('#problemList li', lis =>
+    lis.filter(li => /语速|过短|间隔|重叠|时序/.test(li.querySelector('.badge').textContent)).length);
+  ok(backTiming > 0, '撤销顺延后时间类问题恢复（' + backTiming + ' 个）');
+  ok(/共 \d+ 个问题/.test(backSummary), '撤销后问题汇总恢复');
   await page.keyboard.press('Control+y');
   await page.waitForTimeout(200);
 
@@ -247,6 +254,10 @@ function makeWav(seconds, freq) {
     const x = (t + pad) * (box.width / (end + pad * 2));
     await page.mouse.click(box.x + x, box.y + 10);
     await page.waitForTimeout(80);
+    // 返回画布点击后播放头的实际时间（#playTime 为 0.1s 精度），供容差断言使用
+    const shown = await page.locator('#playTime').textContent();
+    const pm = shown.trim().match(/(\d+):(\d+)\.(\d)/);
+    return pm ? ((+pm[1] * 60 + +pm[2]) * 1000 + +pm[3] * 100) : null;
   }
   async function rowTime(row, field) {
     const v = await page.locator('#cueTbody tr').nth(row).locator(`input[data-field="${field}"]`).inputValue();
@@ -481,16 +492,24 @@ function makeWav(seconds, freq) {
   // ---- 20. 播放头在区间内时以播放头为界 ----
   console.log('20. 播放头为界拆分');
   await page.locator('#cueTbody tr').nth(0).click();
-  await setPlayhead(2000);   // 第 1 条 500~2800 区间内
+  const actualHead = await setPlayhead(2000);   // 第 1 条 500~2800 区间内
   await page.evaluate(() => {
     const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
     ta.focus(); ta.setSelectionRange(4, 4);
   });
   await page.locator('#cueTbody tr').nth(0).locator('.op-split').click();
   await page.waitForTimeout(200);
-  const headEnd = await page.locator('#cueTbody tr').nth(0).locator('input[data-field="end"]').inputValue();
-  const headStart = await page.locator('#cueTbody tr').nth(1).locator('input[data-field="start"]').inputValue();
-  ok(headEnd === '00:00:02,000' && headStart === '00:00:02,000', '播放头为界（02,000）：' + headEnd);
+  const headEndStr = await page.locator('#cueTbody tr').nth(0).locator('input[data-field="end"]').inputValue();
+  const headStartStr = await page.locator('#cueTbody tr').nth(1).locator('input[data-field="start"]').inputValue();
+  const parseTc = s => {
+    const m = s.match(/(\d+):(\d+):(\d+)[.,](\d+)/);
+    return ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 + +m[4];
+  };
+  const headEnd = parseTc(headEndStr), headStart = parseTc(headStartStr);
+  ok(headEnd === headStart, '拆分分界时间连续：' + headEndStr);
+  // 画布点击受像素量化影响，按点击后实际播放头 ±150ms 容差断言，而非毫秒级精确值
+  ok(Math.abs(headEnd - actualHead) <= 150,
+    `分界等于实际播放头（${headEndStr} ≈ ${(actualHead / 1000).toFixed(1)}s，容差 150ms）`);
   await page.keyboard.press('Control+z');
   await page.waitForTimeout(150);
 
@@ -575,14 +594,31 @@ function makeWav(seconds, freq) {
   ok(orphanOut === '一二三四，\n五', '标点跟随不孤立：' + JSON.stringify(orphanOut));
   ok(!orphanOut.split('\n').some(l => /^[，。；：！？、,.]/.test(l)), '无行首孤立标点');
   ok(orphanOut.replace(/\n/g, '') === '一二三四，五', '不删字');
-  // 悬挂标点（仅超宽 1 个标点）不应被标为超长行
-  const orphanSummary = await page.locator('#problemSummary').textContent();
-  ok(!/超长行/.test(orphanSummary), '悬挂标点不计超长行：' + orphanSummary.trim().slice(0, 60));
+  // 悬挂标点（仅超宽 1 个标点）不应让刚重排的这一行被标为超长行 / 孤立标点
+  const row0Marks = await page.$$eval('#cueTbody tr', trs => {
+    const ta = trs[0].querySelector('textarea');
+    return {
+      longline: ta.classList.contains('lay-longline'),
+      orphan: ta.classList.contains('lay-orphan'),
+      hasProblem: trs[0].classList.contains('has-problem'),
+    };
+  });
+  ok(!row0Marks.longline && !row0Marks.orphan && !row0Marks.hasProblem,
+    '重排行无超长行 / 孤立标点标记：' + JSON.stringify(row0Marks));
+  // 第二条尚未处理，其超长行问题应仍在（不断言全局清零）
+  const row1Before = await page.$$eval('#cueTbody tr', trs =>
+    trs[1].querySelector('textarea').classList.contains('lay-longline'));
+  ok(row1Before, '未处理的第二条仍保留超长行标记');
   // 第二条同理：4 字限时「你好世界，」悬挂
   await page.locator('#cueTbody tr').nth(1).locator('.op-rewrap').click();
   await page.waitForTimeout(200);
   const orphanOut2 = await page.locator('#cueTbody tr').nth(1).locator('textarea').inputValue();
   ok(orphanOut2.startsWith('你好世界，'), '第二条例行标点跟随：' + JSON.stringify(orphanOut2));
+  const row1After = await page.$$eval('#cueTbody tr', trs => {
+    const ta = trs[1].querySelector('textarea');
+    return ta.classList.contains('lay-longline') || ta.classList.contains('lay-orphan');
+  });
+  ok(!row1After, '第二条重排后同样无超长行 / 孤立标点标记');
   // 恢复默认规则
   await page.locator('#setMaxChars').fill('18');
   await page.locator('#setMaxChars').dispatchEvent('change');
@@ -615,23 +651,26 @@ function makeWav(seconds, freq) {
   await page.keyboard.press('Control+z');
   await page.waitForTimeout(150);
   ok(await page.locator('#cueTbody tr').count() === 9, '聚焦下 Ctrl+Z 撤销拆分');
-  // 连续两次拆分独立入栈：按钮一次 + 立即 Ctrl+Enter 一次
+  // 800ms 内连续两次 Ctrl+Enter 拆分，各自独立入栈
   await page.evaluate(() => {
     const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
     ta.focus(); ta.setSelectionRange(4, 4);
   });
-  await page.locator('#cueTbody tr').nth(0).locator('.op-split').click();
-  await page.waitForTimeout(150);
+  await page.keyboard.press('Control+Enter');
+  await page.waitForTimeout(120);
+  ok(await page.locator('#cueTbody tr').count() === 10, '第 1 次 Ctrl+Enter 拆分');
   await page.evaluate(() => {
     const ta = document.querySelectorAll('#cueTbody tr')[1].querySelector('textarea');
     ta.focus(); ta.setSelectionRange(2, 2);
   });
   await page.keyboard.press('Control+Enter');
-  await page.waitForTimeout(150);
-  ok(await page.locator('#cueTbody tr').count() === 11, '800ms 内连续两次拆分成功');
+  await page.waitForTimeout(120);
+  ok(await page.locator('#cueTbody tr').count() === 11, '800ms 内第 2 次 Ctrl+Enter 拆分（共 11 条）');
+  // 撤销一次只回退最后一次
   await page.keyboard.press('Control+z');
   await page.waitForTimeout(150);
   ok(await page.locator('#cueTbody tr').count() === 10, '撤销一次只回退最后一次拆分');
+  // 再撤销回退第一次
   await page.keyboard.press('Control+z');
   await page.waitForTimeout(150);
   ok(await page.locator('#cueTbody tr').count() === 9, '再次撤销回退第一次拆分');

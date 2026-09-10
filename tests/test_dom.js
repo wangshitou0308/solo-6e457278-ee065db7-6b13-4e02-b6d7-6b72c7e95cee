@@ -133,22 +133,32 @@ function realClickButton(btn) {
   ok(rows().length === 9, '文本框聚焦下 Ctrl+Z 撤销拆分');
   ok(ta(0).value === '欢迎来到字幕节奏校准台', '撤销后文本合并还原');
 
-  console.log('3c. 800ms 内连续两次拆分分别入栈，撤销一次只回退最后一次');
-  // 第 1 次：在第 4 字符后拆
+  console.log('3c. 800ms 内连续两次 Ctrl+Enter 拆分分别入栈，撤销一次只回退最后一次');
+  function ctrlEnterOn(el) {
+    el.dispatchEvent(new window.KeyboardEvent('keydown',
+      { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));
+  }
+  function undo() {
+    window.document.dispatchEvent(new window.KeyboardEvent('keydown',
+      { key: 'z', ctrlKey: true, bubbles: true, cancelable: true }));
+  }
+  // 第 1 次：首条第 4 字符后，Ctrl+Enter
   ta(0).focus(); ta(0).setSelectionRange(4, 4);
-  realClickButton(rows()[0].querySelector('.op-split'));
-  ok(rows().length === 10, '连续拆分第 1 次');
-  // 第 2 次：对后段立即（<800ms）在第 2 字符后再拆（Ctrl+Enter 路径，焦点在新文本框）
+  ctrlEnterOn(ta(0));
+  ok(rows().length === 10, 'Ctrl+Enter 第 1 次拆分');
+  ok(ta(0).value === '欢迎来到' && ta(1).value === '字幕节奏校准台', '第 1 次文本正确');
+  // 第 2 次：同一同步执行流程内（远小于 800ms 合并窗口），在后段第 2 字符后再按
   ta(1).focus(); ta(1).setSelectionRange(2, 2);
-  ta(1).dispatchEvent(new window.KeyboardEvent('keydown',
-    { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));
-  ok(rows().length === 11, '连续拆分第 2 次（共 11 条）');
+  ctrlEnterOn(ta(1));
+  ok(rows().length === 11, '800ms 内第 2 次 Ctrl+Enter 拆分（共 11 条）');
+  ok(ta(1).value === '字幕', '第 2 次前段文本：' + ta(1).value);
   // 撤销一次：只回退第 2 次
-  window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  undo();
   ok(rows().length === 10, '撤销一次仅回退最后一次拆分（回到 10 条）');
   ok(ta(0).value === '欢迎来到', '第 1 次拆分仍保留');
+  ok(ta(1).value === '字幕节奏校准台', '后段恢复为第 1 次拆分结果');
   // 再撤销：回退第 1 次
-  window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  undo();
   ok(rows().length === 9, '第二次撤销回退第 1 次拆分（回到 9 条）');
   ok(ta(0).value === '欢迎来到字幕节奏校准台', '完全还原');
 

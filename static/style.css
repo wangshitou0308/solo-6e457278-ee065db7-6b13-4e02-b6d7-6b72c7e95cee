@@ -1,0 +1,273 @@
+/* 字幕节奏校准台 — 深色主题 */
+:root {
+  --bg: #0e1320;
+  --panel: #161d2e;
+  --panel2: #1c2538;
+  --border: #2b3652;
+  --text: #dce5f7;
+  --muted: #8595b6;
+  --accent: #4f8cff;
+  --accent-dim: #2c4d8f;
+  --good: #34d399;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --pink: #f472b6;
+  --violet: #a78bfa;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+}
+
+body { display: flex; flex-direction: column; overflow: hidden; }
+
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+.hidden { display: none !important; }
+.grow { flex: 1; }
+
+button {
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.accent { background: var(--accent-dim); border-color: var(--accent); }
+
+input[type="number"], input[type="search"], input[type="text"], select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+
+/* ---------- 顶栏 ---------- */
+#topbar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; font-size: 15px; letter-spacing: 1px; }
+.group { display: flex; align-items: center; gap: 6px; }
+#searchInput { width: 260px; max-width: 40vw; }
+#playTime { min-width: 70px; text-align: center; color: var(--accent); font-size: 14px; }
+
+/* ---------- 规则设置栏 ---------- */
+#settingsBar {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 6px 14px;
+  background: var(--panel2);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+#settingsBar .label { color: var(--muted); }
+#settingsBar label { display: flex; align-items: center; gap: 5px; }
+#settingsBar input[type="number"] { width: 64px; }
+#settingsBar .chk { gap: 4px; }
+#fileInfo { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 草稿提示 ---------- */
+#draftBanner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px;
+  background: #3a2f10;
+  border-bottom: 1px solid #6b5518;
+  color: #ffe1a1;
+  font-size: 13px;
+}
+
+/* ---------- 主区域 ---------- */
+#workspace {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  min-height: 0;
+}
+#leftPane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+#timelineWrap {
+  position: relative;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 10px 2px;
+}
+#timeline {
+  display: block;
+  width: 100%;
+  height: 150px;
+  cursor: crosshair;
+}
+#timelineHint {
+  font-size: 11px;
+  padding: 2px 2px 4px;
+  display: flex; gap: 14px; align-items: center;
+}
+#timelineHint .zoombtns { display: flex; gap: 4px; }
+#timelineHint .zoombtns button { padding: 0 8px; font-size: 12px; line-height: 18px; }
+
+/* ---------- 字幕列表 ---------- */
+#cueListWrap { flex: 1; overflow: auto; position: relative; }
+#cueTable { width: 100%; border-collapse: collapse; font-size: 13px; }
+#cueTable thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--panel2);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 8px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+}
+#cueTable td { padding: 4px 8px; border-bottom: 1px solid #1d2639; vertical-align: top; }
+#cueTable tbody tr { cursor: pointer; }
+#cueTable tbody tr:hover { background: #1a2338; }
+#cueTable tbody tr.selected { background: #22304f; box-shadow: inset 3px 0 0 var(--accent); }
+#cueTable tbody tr.active-play .c-num { color: var(--good); }
+#cueTable tbody tr.has-problem .c-num { color: var(--warn); }
+#cueTable tbody tr.search-hit { outline: 1px dashed #6b5518; outline-offset: -1px; }
+#cueTable tbody tr.search-cur { outline: 1px solid var(--warn); outline-offset: -1px; }
+
+.c-num { width: 44px; font-family: var(--mono); color: var(--muted); }
+#cueTable td.time-cell { white-space: nowrap; }
+#cueTable input.tcode {
+  width: 96px; font-family: var(--mono); font-size: 12px;
+  background: transparent; border: 1px solid transparent; padding: 2px 4px;
+}
+#cueTable input.tcode:hover { border-color: var(--border); }
+#cueTable input.tcode:focus { border-color: var(--accent); background: var(--bg); }
+#cueTable input.tcode.invalid { border-color: var(--bad); color: var(--bad); }
+td.dur, td.cps { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
+td.cps.over { color: var(--warn); font-weight: 600; }
+td.dur.short { color: var(--pink); }
+.c-text { width: 40%; }
+.c-text textarea {
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text);
+  font: inherit;
+  resize: vertical;
+  padding: 2px 4px;
+  border-radius: 4px;
+  line-height: 1.35;
+}
+.c-text textarea:hover { border-color: var(--border); }
+.c-text textarea:focus { border-color: var(--accent); background: var(--bg); }
+
+#emptyState {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  color: var(--muted); text-align: center;
+  pointer-events: none;
+}
+
+/* ---------- 问题面板 ---------- */
+#rightPane {
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+#problemSummary {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+}
+#problemSummary .ok { color: var(--good); }
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.badge.cps { background: #4a3a12; color: var(--warn); }
+.badge.short { background: #482236; color: var(--pink); }
+.badge.gap { background: #342a52; color: var(--violet); }
+.badge.overlap, .badge.order { background: #4c2020; color: var(--bad); }
+
+#problemList {
+  list-style: none;
+  margin: 0; padding: 6px;
+  overflow: auto;
+  flex: 1;
+}
+#problemList li {
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  display: flex; gap: 8px; align-items: baseline;
+  border: 1px solid transparent;
+}
+#problemList li:hover { background: var(--panel2); border-color: var(--border); }
+#problemList li .p-num { font-family: var(--mono); color: var(--muted); min-width: 30px; }
+#problemList li .p-msg { flex: 1; }
+#problemList li .p-text {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 200px;
+}
+
+/* ---------- 差异预览弹窗 ---------- */
+#diffModal {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(5, 8, 15, 0.7);
+  display: flex; align-items: center; justify-content: center;
+}
+#diffBox {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: min(860px, 92vw);
+  max-height: 84vh;
+  display: flex; flex-direction: column;
+  padding: 16px 18px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+#diffBox h3 { margin: 0 0 6px; }
+#diffTableWrap { overflow: auto; flex: 1; margin: 10px 0; border: 1px solid var(--border); border-radius: 6px; }
+#diffTable { width: 100%; border-collapse: collapse; font-size: 13px; }
+#diffTable th, #diffTable td { padding: 6px 10px; border-bottom: 1px solid #1d2639; text-align: left; }
+#diffTable thead th { position: sticky; top: 0; background: var(--panel2); color: var(--muted); }
+#diffTable .old { color: var(--muted); text-decoration: line-through; }
+#diffTable .new { color: var(--good); font-family: var(--mono); }
+#diffTable .mono { font-family: var(--mono); }
+.row-end { display: flex; justify-content: flex-end; gap: 10px; }
+
+/* ---------- 状态栏 ---------- */
+#statusbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 4px 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+#statusMsg { color: var(--text); }
+
+@media (max-width: 900px) {
+  #workspace { grid-template-columns: minmax(0, 1fr) 240px; }
+  #searchInput { width: 150px; }
+}

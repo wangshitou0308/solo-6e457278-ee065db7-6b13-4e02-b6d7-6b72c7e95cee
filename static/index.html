@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>字幕节奏校准台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">字幕节奏校准台</div>
+
+  <div class="group">
+    <button id="btnImport" title="导入 .srt / .vtt 文件">导入字幕</button>
+    <input type="file" id="fileInput" accept=".srt,.vtt,.txt" hidden>
+    <button id="btnSample" title="载入内置示例字幕">载入示例</button>
+  </div>
+
+  <div class="group">
+    <button id="btnUndo" title="撤销 (Ctrl+Z)" disabled>↶ 撤销</button>
+    <button id="btnRedo" title="重做 (Ctrl+Y)" disabled>↷ 重做</button>
+  </div>
+
+  <div class="group">
+    <button id="btnPlay" title="播放/暂停模拟播放头 (空格)">▶ 播放</button>
+    <span id="playTime" class="mono">00:00.0</span>
+  </div>
+
+  <div class="group grow">
+    <input type="search" id="searchInput" placeholder="搜索字幕文本… (Ctrl+F，回车跳下一个)">
+    <span id="searchCount" class="muted"></span>
+  </div>
+
+  <div class="group">
+    <select id="exportFormat" title="导出格式">
+      <option value="orig">原格式</option>
+      <option value="srt">SRT</option>
+      <option value="vtt">VTT</option>
+    </select>
+    <button id="btnExport" class="primary" disabled>导出</button>
+  </div>
+</header>
+
+<section id="settingsBar">
+  <span class="label">节奏规则：</span>
+  <label>语速上限 <input type="number" id="setCps" min="1" max="60" step="1"> 字/秒</label>
+  <label>最短停留 <input type="number" id="setMinDur" min="100" max="10000" step="100"> ms</label>
+  <label>最小间隔 <input type="number" id="setMinGap" min="0" max="2000" step="10"> ms</label>
+  <label class="chk"><input type="checkbox" id="setOverlap"> 允许重叠</label>
+  <button id="btnAutoFix" class="accent" disabled>自动顺延…</button>
+  <span id="fileInfo" class="muted grow"></span>
+  <span id="draftInfo" class="muted"></span>
+</section>
+
+<div id="draftBanner" class="hidden">
+  <span id="draftBannerText"></span>
+  <button id="btnDraftRestore" class="accent">恢复草稿</button>
+  <button id="btnDraftDismiss">忽略并删除</button>
+</div>
+
+<main id="workspace">
+  <section id="leftPane">
+    <div id="timelineWrap">
+      <canvas id="timeline"></canvas>
+      <div id="timelineHint" class="muted">
+        <span class="zoombtns">
+          <button id="btnZoomOut" title="缩小">−</button>
+          <button id="btnZoomIn" title="放大">＋</button>
+          <button id="btnFit" title="适配全部 (0)">适配</button>
+        </span>
+        <span>滚轮缩放 · 拖动色块移动/调整边缘 · 拖动标尺移动播放头 · 空格播放</span>
+      </div>
+    </div>
+    <div id="cueListWrap">
+      <table id="cueTable">
+        <thead>
+          <tr><th class="c-num">#</th><th>开始</th><th>结束</th><th>时长</th><th>语速</th><th class="c-text">文本</th></tr>
+        </thead>
+        <tbody id="cueTbody"></tbody>
+      </table>
+      <div id="emptyState">
+        <p>尚未载入字幕。</p>
+        <p>点击 <b>导入字幕</b> 选择 .srt / .vtt 文件，或点击 <b>载入示例</b> 立即体验。</p>
+      </div>
+    </div>
+  </section>
+
+  <aside id="rightPane">
+    <div id="problemSummary">未载入字幕</div>
+    <ul id="problemList"></ul>
+  </aside>
+</main>
+
+<div id="diffModal" class="hidden">
+  <div id="diffBox">
+    <h3>自动顺延 — 修改前后差异预览</h3>
+    <p class="muted" id="diffSummary"></p>
+    <div id="diffTableWrap">
+      <table id="diffTable">
+        <thead>
+          <tr><th>#</th><th>开始（前 → 后）</th><th>结束（前 → 后）</th><th>文本</th></tr>
+        </thead>
+        <tbody id="diffTbody"></tbody>
+      </table>
+    </div>
+    <div class="row-end">
+      <button id="btnDiffCancel">取消</button>
+      <button id="btnDiffApply" class="primary">应用顺延</button>
+    </div>
+  </div>
+</div>
+
+<footer id="statusbar">
+  <span id="statusMsg">就绪</span>
+  <span class="grow"></span>
+  <span class="muted">快捷键：空格播放 · ←/→ 平移 · [ ] 起点 · ; ' 终点 · Shift 大步 · Alt 小步 · Ctrl+Z/Y 撤销重做</span>
+</footer>
+
+<script src="/static/core.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

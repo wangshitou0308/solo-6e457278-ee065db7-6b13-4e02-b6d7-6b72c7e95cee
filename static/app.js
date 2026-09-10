@@ -14,7 +14,9 @@
   var searchInput = $('searchInput'), searchCount = $('searchCount');
   var exportFormat = $('exportFormat'), btnExport = $('btnExport');
   var setCps = $('setCps'), setMinDur = $('setMinDur'), setMinGap = $('setMinGap'), setOverlap = $('setOverlap');
+  var setMaxChars = $('setMaxChars'), setMaxLines = $('setMaxLines');
   var btnAutoFix = $('btnAutoFix'), fileInfo = $('fileInfo'), draftInfo = $('draftInfo');
+  var btnRewrapAll = $('btnRewrapAll');
   var draftBanner = $('draftBanner'), draftBannerText = $('draftBannerText');
   var btnDraftRestore = $('btnDraftRestore'), btnDraftDismiss = $('btnDraftDismiss');
   var timelineWrap = $('timelineWrap'), canvas = $('timeline');
@@ -23,6 +25,8 @@
   var problemSummary = $('problemSummary'), problemList = $('problemList');
   var diffModal = $('diffModal'), diffSummary = $('diffSummary'), diffTbody = $('diffTbody');
   var btnDiffCancel = $('btnDiffCancel'), btnDiffApply = $('btnDiffApply');
+  var rewrapModal = $('rewrapModal'), rewrapSummary = $('rewrapSummary'), rewrapTbody = $('rewrapTbody');
+  var btnRewrapCancel = $('btnRewrapCancel'), btnRewrapApply = $('btnRewrapApply');
   var statusMsg = $('statusMsg');
   // 媒体对照
   var mediaBanner = $('mediaBanner'), mediaBannerText = $('mediaBannerText');
@@ -51,7 +55,10 @@
   var MIN_PX = 0.002, MAX_PX = 2;       // 每毫秒像素数范围
   var MIN_DUR = 40;                      // 拖动时允许的最小时长 ms
   var EDGE_PX = 6;                       // 边缘拖拽判定宽度
-  var TYPE_LABEL = { cps: '语速', short: '过短', gap: '间隔', overlap: '重叠', order: '时序' };
+  var TYPE_LABEL = {
+    cps: '语速', short: '过短', gap: '间隔', overlap: '重叠', order: '时序',
+    longline: '超长行', orphan: '孤立标点', toomany: '超行数',
+  };
 
   // ---------- 状态 ----------
   var state = {
@@ -62,7 +69,8 @@
     playheadMs: 0,
     playing: false,
     view: { startMs: 0, pxPerMs: 0.1 },
-    settings: { cpsMax: 20, minDurMs: 1000, minGapMs: 100, allowOverlap: false },
+    settings: { cpsMax: 20, minDurMs: 1000, minGapMs: 100, allowOverlap: false,
+      maxChars: 18, maxLines: 2 },
     problems: [],
     problemByCue: {},
     undoStack: [], redoStack: [],
@@ -76,6 +84,7 @@
     loop: { on: false, padBefore: 300, padAfter: 500 },
     anchors: { a1: null, a2: null },   // {cue, num, srcTime, dstTime}
     pendingSync: null,                  // 双锚点预览结果
+    pendingRewrap: null,                // 批量分行预览计划
   };
   var rowEls = [];        // 每行 DOM 缓存
   var activeRowIdx = -1;  // 播放头当前所在字幕行
@@ -208,6 +217,20 @@
     var has = !!state.doc;
     btnExport.disabled = !has;
     btnAutoFix.disabled = !has;
+    btnRewrapAll.disabled = !has;
+  }
+
+  // 最后一条不能与下一条合并；无文档时全部禁用
+  function markRowOps() {
+    if (!state.doc) return;
+    state.doc.cues.forEach(function (_, i) {
+      var tr = rowEls[i];
+      if (!tr) return;
+      var canMerge = i < state.doc.cues.length - 1;
+      tr.querySelector('.op-merge').disabled = !canMerge;
+      tr.querySelector('.op-split').disabled = false;
+      tr.querySelector('.op-rewrap').disabled = false;
+    });
   }
 
   // ---------- 字幕列表 ----------
@@ -226,10 +249,15 @@
         '<td class="time-cell"><input class="tcode" data-field="end" spellcheck="false"></td>' +
         '<td class="dur"></td>' +
         '<td class="cps"></td>' +
-        '<td class="c-text"><textarea spellcheck="false"></textarea></td>';
+        '<td class="c-text"><textarea spellcheck="false"></textarea></td>' +
+        '<td class="c-ops">' +
+          '<button class="op-split" title="在文本光标处拆分（或按 Ctrl+Enter）">拆</button>' +
+          '<button class="op-merge" title="与下一条合并（时间覆盖原区间）">合</button>' +
+          '<button class="op-rewrap" title="按每行字数 / 最多行数智能分行">排</button>' +
+        '</td>';
       var ta = tr.querySelector('textarea');
       ta.value = cue.lines.join('\n');
-      ta.rows = clamp(cue.lines.length, 1, 3);
+      ta.rows = clamp(cue.lines.length, 1, 4);
       frag.appendChild(tr);
       rowEls.push(tr);
       fillRowTimes(i);
@@ -237,6 +265,7 @@
     cueTbody.appendChild(frag);
     state.doc.cues.forEach(function (_, i) { fillRowTimes(i); });
     markSelectedRow();
+    markRowOps();
     runSearch(false);
   }
 
@@ -300,6 +329,208 @@
     }
   });
 
+  // ---------- 拆分 / 合并 / 智能分行 ----------
+
+  // 文本框的 change 只在失焦时触发；结构操作前先把未失焦的编辑静默提交到模型。
+  // 返回是否发生了提交（不单独压入撤销栈，文本修改并入随后的结构操作一步）。
+  function commitRow(i) {
+    if (!state.doc || i < 0 || i >= state.doc.cues.length) return false;
+    var rowTa = rowEls[i] && rowEls[i].querySelector('textarea');
+    if (!rowTa) return false;
+    var cue = state.doc.cues[i];
+    var lines = rowTa.value.split(/\r?\n/);
+    while (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+    var same = lines.length === cue.lines.length &&
+      lines.every(function (l, k) { return l === cue.lines[k]; });
+    if (same) return false;
+    cue.lines = lines;
+    return true;
+  }
+  function commitAllRows() {
+    if (!state.doc) return false;
+    var any = false;
+    for (var i = 0; i < state.doc.cues.length; i++) {
+      if (commitRow(i)) any = true;
+    }
+    return any;
+  }
+
+  // 未指定光标时：在文本中部 45%~55% 区间找最晚的标点/空格断点，找不到则正中间
+  function pickMiddleCaret(text) {
+    var mid = Math.floor(text.length / 2);
+    var lo = Math.floor(text.length * 0.45), hi = Math.ceil(text.length * 0.55);
+    var best = -1;
+    for (var k = Math.min(hi, text.length - 1); k >= lo; k--) {
+      if (/[,.;:!?，。；：！？、…\s]/.test(text[k])) { best = k + 1; break; }
+    }
+    return best >= 0 ? best : mid;
+  }
+
+  // 在第 i 条、其文本框光标 caret 处拆分；未聚焦该行文本框时按文本中点回退
+  function splitAtCaret(i, ta) {
+    if (!state.doc) return;
+    // 输入后未失焦直接拆分：先把文本框当前内容提交到模型
+    var rowTa = ta || (rowEls[i] && rowEls[i].querySelector('textarea'));
+    if (rowTa && document.activeElement === rowTa) commitRow(i);
+    var cue = state.doc.cues[i];
+    var full = cue.lines.join('\n');
+    var caret = null;
+    var focusedOther = document.activeElement &&
+      document.activeElement.matches && document.activeElement.matches('textarea');
+    if (rowTa && document.activeElement === rowTa) caret = rowTa.selectionStart;
+    if (caret === null) {
+      if (focusedOther) { setStatus('请先点击要拆分字幕的文本框'); return; }
+      // 未聚焦文本框：优先在中点附近的断点（标点/空格）拆分，否则正中间
+      caret = pickMiddleCaret(full);
+    }
+    var beforeLines = full.slice(0, caret).split(/\r?\n/);
+    var afterLines = full.slice(caret).split(/\r?\n/);
+    var inRange = state.playheadMs > cue.start && state.playheadMs < cue.end;
+    var res = C.splitDoc(state.doc.cues, i, beforeLines, afterLines,
+      Math.round(state.playheadMs), state.doc.format);
+    if (res.error) { setStatus('无法拆分：' + res.error); return; }
+    pushUndo('split');
+    state.doc.cues = res.cues;
+    state.anchors.a1 = null; state.anchors.a2 = null;
+    updateAnchorButtons();
+    renderList();
+    // 选中后段，光标停在其文本开头，便于连续拆分
+    var newSel = i + 1;
+    selectCue(newSel, { scroll: true });
+    afterChange('已在 ' + (inRange
+      ? '播放头 ' + C.fmtMs(res.at, 'srt')
+      : '按文字比例 ' + C.fmtMs(res.at, 'srt')) + ' 拆分为第 ' +
+      state.doc.cues[i].num + ' / ' + state.doc.cues[newSel].num + ' 条');
+    var nta = rowEls[newSel] && rowEls[newSel].querySelector('textarea');
+    if (nta) { nta.focus(); nta.setSelectionRange(0, 0); }
+  }
+
+  // 合并第 i 条与其下一条
+  function mergeWithNext(i) {
+    if (!state.doc) return;
+    commitRow(i);
+    commitRow(i + 1);
+    var a = state.doc.cues[i], b = state.doc.cues[i + 1];
+    var res = C.mergeDoc(state.doc.cues, i, state.doc.format);
+    if (res.error) { setStatus('无法合并：' + res.error); return; }
+    pushUndo('merge');
+    state.doc.cues = res.cues;
+    state.anchors.a1 = null; state.anchors.a2 = null;
+    updateAnchorButtons();
+    renderList();
+    selectCue(i, { scroll: true });
+    afterChange('已合并第 ' + a.num + ' / ' + b.num + ' 条，时间覆盖 ' +
+      C.fmtMs(res.cues[i].start, 'srt') + ' → ' + C.fmtMs(res.cues[i].end, 'srt'));
+  }
+
+  // 单条智能分行
+  function rewrapOne(i) {
+    if (!state.doc) return;
+    commitRow(i);
+    var cue = state.doc.cues[i];
+    var res = C.rewrapCue(cue, state.settings.maxChars, state.settings.maxLines);
+    if (!res.ok) {
+      setStatus('第 ' + cue.num + ' 条无法智能分行：' + res.error);
+      return false;
+    }
+    var changed = res.lines.length !== cue.lines.length ||
+      res.lines.some(function (l, idx) { return l !== cue.lines[idx]; });
+    if (!changed) {
+      setStatus('第 ' + cue.num + ' 条已满足每行 ' + state.settings.maxChars +
+        ' 字、最多 ' + state.settings.maxLines + ' 行，无需重排');
+      return true;
+    }
+    pushUndo('rewrap');
+    cue.lines = res.lines;
+    renderList();
+    selectCue(i, { scroll: false });
+    afterChange('已对第 ' + cue.num + ' 条智能分行（' + res.lines.length + ' 行，未删字）');
+    return true;
+  }
+
+  // 操作列按钮委托
+  cueTbody.addEventListener('click', function (e) {
+    var btn = e.target.closest('button.op-split, button.op-merge, button.op-rewrap');
+    if (!btn) return;
+    e.stopPropagation();
+    var tr = e.target.closest('tr');
+    if (!tr || !state.doc) return;
+    var i = +tr.dataset.i;
+    selectCue(i, { scroll: false });
+    if (btn.classList.contains('op-split')) splitAtCaret(i, tr.querySelector('textarea'));
+    else if (btn.classList.contains('op-merge')) mergeWithNext(i);
+    else rewrapOne(i);
+  });
+
+  // 文本框中 Ctrl+Enter 在光标处拆分
+  cueTbody.addEventListener('keydown', function (e) {
+    if (!e.target.matches('textarea')) return;
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.keyCode === 13)) {
+      e.preventDefault();
+      var tr = e.target.closest('tr');
+      if (tr) splitAtCaret(+tr.dataset.i, e.target);
+    }
+  });
+
+  // ---------- 批量智能分行预览 ----------
+  function openRewrapModal() {
+    if (!state.doc) return;
+    commitAllRows();
+    var mc = state.settings.maxChars, ml = state.settings.maxLines;
+    var plan = C.planRewrap(state.doc.cues, mc, ml);
+    state.pendingRewrap = plan;
+    var nChange = 0, nFail = 0, nSame = 0;
+    rewrapTbody.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    plan.forEach(function (item, i) {
+      var cue = state.doc.cues[i];
+      var tr = document.createElement('tr');
+      var status, cls;
+      if (!item.ok) { nFail++; cls = 'rw-fail'; status = '<span class="st-fail">无法重排</span>'; }
+      else if (item.changed) { nChange++; cls = ''; status = '<span class="st-ok">将重排</span>'; }
+      else { nSame++; cls = 'rw-same'; status = '<span class="st-skip">已合规</span>'; }
+      tr.className = cls;
+      var newCell;
+      if (item.ok) {
+        newCell = '<td class="rt-new">' + esc(item.lines.join('\n')) + '</td>';
+      } else {
+        newCell = '<td class="rt-err">' + esc(item.error) + '</td>';
+      }
+      tr.innerHTML =
+        '<td class="mono">#' + esc(cue.num) + '</td>' +
+        '<td class="rt-old">' + esc(cue.lines.join(' / ')) + '</td>' +
+        newCell +
+        '<td>' + status + '</td>';
+      frag.appendChild(tr);
+    });
+    rewrapTbody.appendChild(frag);
+    rewrapSummary.textContent =
+      '规则：每行 ' + mc + ' 字、最多 ' + ml + ' 行；优先在标点或空格处换行，' +
+      '不拆 HTML 标签、英文单词与数字串，且不删字。' +
+      '将重排 ' + nChange + ' 条，已合规 ' + nSame + ' 条，无法满足 ' + nFail + ' 条。';
+    btnRewrapApply.disabled = nChange === 0;
+    rewrapModal.classList.remove('hidden');
+  }
+  function hideRewrap() {
+    rewrapModal.classList.add('hidden');
+    state.pendingRewrap = null;
+  }
+  btnRewrapAll.addEventListener('click', openRewrapModal);
+  btnRewrapCancel.addEventListener('click', hideRewrap);
+  rewrapModal.addEventListener('click', function (e) { if (e.target === rewrapModal) hideRewrap(); });
+  btnRewrapApply.addEventListener('click', function () {
+    var plan = state.pendingRewrap;
+    if (!plan || !state.doc) { hideRewrap(); return; }
+    var applied = 0;
+    pushUndo('rewrapall');
+    plan.forEach(function (item, i) {
+      if (item.ok && item.changed) { state.doc.cues[i].lines = item.lines.slice(); applied++; }
+    });
+    hideRewrap();
+    renderList();
+    afterChange('已批量智能分行 ' + applied + ' 条（不删字，失败条目保持原样）');
+  });
+
   // ---------- 选择 ----------
   function selectCue(i, opts) {
     opts = opts || {};
@@ -329,14 +560,27 @@
       problemList.innerHTML = '';
       return;
     }
-    state.problems = C.analyze(state.doc.cues, state.settings);
+    state.problems = C.analyze(state.doc.cues, state.settings)
+      .concat(C.analyzeLayout(state.doc.cues, state.settings.maxChars, state.settings.maxLines));
     state.problemByCue = {};
     state.problems.forEach(function (p) {
       (state.problemByCue[p.cue] = state.problemByCue[p.cue] || []).push(p.type);
     });
-    // 行标记
+    // 行标记（节奏问题 + 分行问题）
     rowEls.forEach(function (tr, i) {
       tr.classList.toggle('has-problem', !!state.problemByCue[i]);
+      var ta = tr.querySelector('textarea');
+      if (ta) {
+        var types = state.problemByCue[i] || [];
+        ta.classList.toggle('lay-longline', types.indexOf('longline') !== -1);
+        ta.classList.toggle('lay-orphan', types.indexOf('orphan') !== -1);
+        ta.classList.toggle('lay-toomany', types.indexOf('toomany') !== -1);
+        var lay = [];
+        if (types.indexOf('longline') !== -1) lay.push('超长行');
+        if (types.indexOf('orphan') !== -1) lay.push('孤立标点');
+        if (types.indexOf('toomany') !== -1) lay.push('超行数');
+        ta.title = lay.length ? '分行问题：' + lay.join('、') : '';
+      }
     });
     // 汇总
     var counts = {};
@@ -1063,6 +1307,10 @@
       if (e.key === 'Escape') hideAnchor();
       return;
     }
+    if (!rewrapModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') hideRewrap();
+      return;
+    }
     var step = e.shiftKey ? 500 : (e.altKey ? 10 : 100);
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
       e.preventDefault();
@@ -1144,6 +1392,7 @@
   // ---------- 自动顺延与差异预览 ----------
   btnAutoFix.addEventListener('click', function () {
     if (!state.doc) return;
+    commitAllRows();
     var changes = C.computeAutoFix(state.doc.cues, state.settings);
     if (!changes.length) {
       setStatus('当前规则下无需顺延');
@@ -1204,6 +1453,7 @@
   }
   function saveDraft() {
     if (!state.dirty || !state.doc) return;
+    commitAllRows();   // 文本框中尚未失焦的编辑也要入草稿
     fetch('/api/draft', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1243,8 +1493,9 @@
     if (!d || !state.doc) { hideDraftBanner(); return; }
     try {
       var payload = JSON.parse(d.content);
-      if (!payload.cues || payload.cues.length !== state.doc.cues.length) {
-        setStatus('草稿与当前文件条目数不一致，未恢复');
+      if (!payload || !Array.isArray(payload.cues) || !payload.cues.length ||
+          payload.cues.some(function (c) { return !c || !Array.isArray(c.lines); })) {
+        setStatus('草稿内容无法识别，未恢复');
         hideDraftBanner();
         return;
       }
@@ -1252,7 +1503,7 @@
       state.doc.cues = payload.cues;
       if (payload.header !== undefined) state.doc.header = payload.header;
       renderList();
-      afterChange('已恢复本地草稿');
+      afterChange('已恢复本地草稿（' + payload.cues.length + ' 条）');
     } catch (e) {
       setStatus('草稿内容损坏，未恢复');
     }
@@ -1302,6 +1553,8 @@
 
   btnExport.addEventListener('click', function () {
     if (!state.doc) return;
+    // 导出前提交文本框中尚未失焦的编辑
+    commitAllRows();
     var sel = exportFormat.value;
     var fmt = sel === 'orig' ? state.doc.format : sel;
     var text = C.serialize(state.doc, fmt);
@@ -1339,12 +1592,16 @@
     setMinDur.value = state.settings.minDurMs;
     setMinGap.value = state.settings.minGapMs;
     setOverlap.checked = state.settings.allowOverlap;
+    setMaxChars.value = state.settings.maxChars;
+    setMaxLines.value = state.settings.maxLines;
   }
   function saveSettings() {
     state.settings.cpsMax = clamp(+setCps.value || 20, 1, 60);
     state.settings.minDurMs = clamp(+setMinDur.value || 1000, 100, 10000);
     state.settings.minGapMs = clamp(+setMinGap.value || 0, 0, 2000);
     state.settings.allowOverlap = setOverlap.checked;
+    state.settings.maxChars = clamp(+setMaxChars.value || 18, 2, 120);
+    state.settings.maxLines = clamp(+setMaxLines.value || 2, 1, 8);
     localStorage.setItem('subcal.settings', JSON.stringify(state.settings));
     if (state.doc) {
       analyzeAndRender();
@@ -1352,7 +1609,7 @@
       drawCanvas();
     }
   }
-  [setCps, setMinDur, setMinGap, setOverlap].forEach(function (el) {
+  [setCps, setMinDur, setMinGap, setOverlap, setMaxChars, setMaxLines].forEach(function (el) {
     el.addEventListener('change', saveSettings);
   });
 

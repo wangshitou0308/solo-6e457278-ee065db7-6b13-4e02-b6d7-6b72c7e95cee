@@ -82,6 +82,8 @@ input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
 #settingsBar label { display: flex; align-items: center; gap: 5px; }
 #settingsBar input[type="number"] { width: 64px; }
 #settingsBar .chk { gap: 4px; }
+#settingsBar .rule-sep { color: var(--border); margin: 0 2px; }
+#settingsBar input#setMaxChars, #settingsBar input#setMaxLines { width: 56px; }
 #fileInfo { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- 草稿提示 ---------- */
@@ -222,7 +224,7 @@ button.mini { padding: 1px 8px; font-size: 12px; }
 td.dur, td.cps { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
 td.cps.over { color: var(--warn); font-weight: 600; }
 td.dur.short { color: var(--pink); }
-.c-text { width: 40%; }
+.c-text { width: 36%; }
 .c-text textarea {
   width: 100%;
   background: transparent;
@@ -236,6 +238,26 @@ td.dur.short { color: var(--pink); }
 }
 .c-text textarea:hover { border-color: var(--border); }
 .c-text textarea:focus { border-color: var(--accent); background: var(--bg); }
+/* 分行规则问题：文本框左侧色条 + 行底纹（叠加在节奏问题之上） */
+.c-text textarea.lay-longline { box-shadow: inset 3px 0 0 var(--warn); }
+.c-text textarea.lay-orphan   { box-shadow: inset 3px 0 0 var(--pink); }
+.c-text textarea.lay-toomany  { box-shadow: inset 3px 0 0 var(--bad); }
+.c-text textarea.lay-longline.lay-orphan,
+.c-text textarea.lay-longline.lay-toomany,
+.c-text textarea.lay-orphan.lay-toomany { box-shadow: inset 3px 0 0 var(--violet); }
+
+/* 行内操作列 */
+.c-ops { width: 92px; white-space: nowrap; }
+td.c-ops { text-align: center; }
+td.c-ops button {
+  padding: 1px 6px;
+  font-size: 12px;
+  margin: 0 1px;
+  line-height: 18px;
+}
+td.c-ops button.op-split  { color: #9fc0ff; }
+td.c-ops button.op-merge  { color: #aee3f8; }
+td.c-ops button.op-rewrap { color: #cbb8ff; }
 
 #emptyState {
   position: absolute; inset: 0;
@@ -270,6 +292,9 @@ td.dur.short { color: var(--pink); }
 .badge.short { background: #482236; color: var(--pink); }
 .badge.gap { background: #342a52; color: var(--violet); }
 .badge.overlap, .badge.order { background: #4c2020; color: var(--bad); }
+.badge.longline { background: #4a3a12; color: var(--warn); }
+.badge.orphan { background: #482236; color: var(--pink); }
+.badge.toomany { background: #4c2020; color: var(--bad); }
 
 #problemList {
   list-style: none;
@@ -297,12 +322,12 @@ td.dur.short { color: var(--pink); }
 }
 
 /* ---------- 差异预览弹窗 ---------- */
-#diffModal, #anchorModal {
+#diffModal, #anchorModal, #rewrapModal {
   position: fixed; inset: 0; z-index: 50;
   background: rgba(5, 8, 15, 0.7);
   display: flex; align-items: center; justify-content: center;
 }
-#diffBox, #anchorBox {
+#diffBox, #anchorBox, #rewrapBox {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -312,13 +337,23 @@ td.dur.short { color: var(--pink); }
   padding: 16px 18px;
   box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
 }
-#diffBox h3, #anchorBox h3 { margin: 0 0 6px; }
-#diffTableWrap, #anchorDiffWrap { overflow: auto; flex: 1; margin: 10px 0; border: 1px solid var(--border); border-radius: 6px; }
-#diffTable, #anchorDiffTable, #anchorTable { width: 100%; border-collapse: collapse; font-size: 13px; }
+#diffBox h3, #anchorBox h3, #rewrapBox h3 { margin: 0 0 6px; }
+#diffTableWrap, #anchorDiffWrap, #rewrapTableWrap { overflow: auto; flex: 1; margin: 10px 0; border: 1px solid var(--border); border-radius: 6px; }
+#diffTable, #anchorDiffTable, #anchorTable, #rewrapTable { width: 100%; border-collapse: collapse; font-size: 13px; }
 #diffTable th, #diffTable td,
 #anchorDiffTable th, #anchorDiffTable td,
-#anchorTable th, #anchorTable td { padding: 6px 10px; border-bottom: 1px solid #1d2639; text-align: left; }
-#diffTable thead th, #anchorDiffTable thead th, #anchorTable thead th { position: sticky; top: 0; background: var(--panel2); color: var(--muted); }
+#anchorTable th, #anchorTable td,
+#rewrapTable th, #rewrapTable td { padding: 6px 10px; border-bottom: 1px solid #1d2639; text-align: left; vertical-align: top; }
+#diffTable thead th, #anchorDiffTable thead th, #anchorTable thead th, #rewrapTable thead th { position: sticky; top: 0; background: var(--panel2); color: var(--muted); }
+#rewrapTable td.rt-old { color: var(--muted); }
+#rewrapTable td.rt-new { color: var(--good); white-space: pre-line; }
+#rewrapTable td.rt-err { color: var(--bad); }
+#rewrapTable tr.rw-fail { background: #2a1820; }
+#rewrapTable tr.rw-same td { color: var(--muted); }
+#rewrapTable .st-ok { color: var(--good); }
+#rewrapTable .st-fail { color: var(--bad); }
+#rewrapTable .st-skip { color: var(--muted); }
+#rewrapTable td .linebreak { color: var(--accent); font-weight: 700; }
 #diffTable .old, #anchorDiffTable .old { color: var(--muted); text-decoration: line-through; }
 #diffTable .new, #anchorDiffTable .new { color: var(--good); font-family: var(--mono); }
 #diffTable .mono, #anchorDiffTable .mono, #anchorTable .mono { font-family: var(--mono); }

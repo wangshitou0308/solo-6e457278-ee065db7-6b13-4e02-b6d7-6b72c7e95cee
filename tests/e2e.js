@@ -391,6 +391,216 @@ function makeWav(seconds, freq) {
   await page.locator('#btnDraftDismiss').click();   // 清理草稿，避免影响后续运行
   await page.waitForTimeout(200);
 
+  // ---- 17. 分行规则检查 ----
+  console.log('17. 分行规则检查');
+  await page.locator('#btnSample').click();
+  await page.waitForTimeout(400);
+  if (await page.locator('#draftBanner').isVisible()) await page.locator('#btnDraftDismiss').click();
+  ok(await page.locator('#setMaxChars').inputValue() === '18', '默认每行 18 字');
+  ok(await page.locator('#setMaxLines').inputValue() === '2', '默认最多 2 行');
+  const layoutSummary = await page.locator('#problemSummary').textContent();
+  ok(/超长行/.test(layoutSummary), '汇总出现超长行徽章：' + layoutSummary.trim().slice(0, 80));
+  const longItems = await page.locator('#problemList li').filter({ hasText: '超过每行' }).count();
+  ok(longItems > 0, `问题列表列出超长行（${longItems} 条）`);
+  // 点击分行问题可定位
+  await page.locator('#problemList li').filter({ hasText: '超过每行' }).first().click();
+  await page.waitForTimeout(150);
+  ok(await page.locator('#cueTbody tr.selected').count() === 1, '点击分行问题定位到字幕');
+  // 调宽每行字数后问题消失（设置持久化）
+  await page.locator('#setMaxChars').fill('40');
+  await page.locator('#setMaxChars').dispatchEvent('change');
+  await page.waitForTimeout(150);
+  const looseSummary = await page.locator('#problemSummary').textContent();
+  ok(!/超长行/.test(looseSummary), '放宽每行字数后超长行消失');
+  await page.locator('#setMaxChars').fill('18');
+  await page.locator('#setMaxChars').dispatchEvent('change');
+  await page.waitForTimeout(150);
+
+  // ---- 18. 单条智能分行 ----
+  console.log('18. 单条智能分行');
+  const taRow = page.locator('#cueTbody tr').nth(3);   // 示例第 4 条为长句
+  const taBefore = await taRow.locator('textarea').inputValue();
+  await taRow.locator('.op-rewrap').click();
+  await page.waitForTimeout(200);
+  const taAfter = await taRow.locator('textarea').inputValue();
+  ok(taAfter !== taBefore && taAfter.includes('\n'), '智能分行产生换行：' + JSON.stringify(taAfter));
+  const rwLines = taAfter.split('\n');
+  ok(rwLines.length <= 2, '不超过最多 2 行');
+  ok(rwLines.every(l => Array.from(l).length <= 18), '每行不超过 18 字');
+  ok(taAfter.replace(/\n/g, '') === taBefore.replace(/\n/g, ''), '分行不删字');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  ok((await taRow.locator('textarea').inputValue()) === taBefore, '撤销智能分行');
+  await page.keyboard.press('Control+y');
+  await page.waitForTimeout(150);
+
+  // ---- 19. 光标拆分（播放头在区间外 → 按字符比例） ----
+  console.log('19. 拆分');
+  const n0 = await page.locator('#cueTbody tr').count();
+  await page.evaluate(() => {
+    const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
+    ta.focus(); ta.setSelectionRange(4, 4);  // 「欢迎来到」|「字幕节奏校准台」
+  });
+  await page.locator('#cueTbody tr').nth(0).locator('.op-split').click();
+  await page.waitForTimeout(200);
+  ok(await page.locator('#cueTbody tr').count() === n0 + 1, '拆分后条数 +1');
+  const splitTexts = await page.$$eval('#cueTbody tr', trs =>
+    trs.slice(0, 2).map(tr => tr.querySelector('textarea').value));
+  ok(splitTexts[0] === '欢迎来到' && splitTexts[1] === '字幕节奏校准台',
+    '按光标拆分文本：' + JSON.stringify(splitTexts));
+  const splitEnd = await page.locator('#cueTbody tr').nth(0).locator('input[data-field="end"]').inputValue();
+  const splitStart = await page.locator('#cueTbody tr').nth(1).locator('input[data-field="start"]').inputValue();
+  ok(splitEnd === splitStart, '分界时间连续：' + splitEnd);
+  // 500~2800，4:7 → 500+2300*4/11 = 1336
+  ok(splitEnd === '00:00:01,336', '按有效字符比例分配（≈1336ms）：' + splitEnd);
+  const splitNums = await page.$$eval('#cueTbody tr .c-num', els => els.slice(0, 3).map(e => e.textContent));
+  ok(splitNums.join(',') === '1,2,3', 'SRT 编号重排：' + splitNums.join(','));
+  // 光标在文本开头 → 拒绝
+  const nRefuse = await page.locator('#cueTbody tr').count();
+  await page.evaluate(() => {
+    const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
+    ta.focus(); ta.setSelectionRange(0, 0);
+  });
+  await page.locator('#cueTbody tr').nth(0).locator('.op-split').click();
+  await page.waitForTimeout(150);
+  ok(await page.locator('#cueTbody tr').count() === nRefuse, '光标在开头不拆分');
+  ok((await page.locator('#statusMsg').textContent()).includes('均需要有文本'), '状态栏说明拆分原因');
+  // Ctrl+Enter 快捷键
+  await page.evaluate(() => {
+    const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
+    ta.focus(); ta.setSelectionRange(2, 2);
+  });
+  await page.keyboard.press('Control+Enter');
+  await page.waitForTimeout(150);
+  ok(await page.locator('#cueTbody tr').count() === nRefuse + 1, 'Ctrl+Enter 快捷拆分');
+  // 撤销全部拆分
+  await page.keyboard.press('Control+z');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(200);
+
+  // ---- 20. 播放头在区间内时以播放头为界 ----
+  console.log('20. 播放头为界拆分');
+  await page.locator('#cueTbody tr').nth(0).click();
+  await setPlayhead(2000);   // 第 1 条 500~2800 区间内
+  await page.evaluate(() => {
+    const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
+    ta.focus(); ta.setSelectionRange(4, 4);
+  });
+  await page.locator('#cueTbody tr').nth(0).locator('.op-split').click();
+  await page.waitForTimeout(200);
+  const headEnd = await page.locator('#cueTbody tr').nth(0).locator('input[data-field="end"]').inputValue();
+  const headStart = await page.locator('#cueTbody tr').nth(1).locator('input[data-field="start"]').inputValue();
+  ok(headEnd === '00:00:02,000' && headStart === '00:00:02,000', '播放头为界（02,000）：' + headEnd);
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+
+  // ---- 21. 合并相邻字幕 ----
+  console.log('21. 合并');
+  const nMerge = await page.locator('#cueTbody tr').count();
+  const mergeTimes = await page.$$eval('#cueTbody tr', trs => [
+    trs[0].querySelector('input[data-field="start"]').value,
+    trs[1].querySelector('input[data-field="end"]').value,
+  ]);
+  await page.locator('#cueTbody tr').nth(0).locator('.op-merge').click();
+  await page.waitForTimeout(200);
+  ok(await page.locator('#cueTbody tr').count() === nMerge - 1, '合并后条数 -1');
+  const mergedText = await page.locator('#cueTbody tr').nth(0).locator('textarea').inputValue();
+  ok(mergedText.includes('\n'), '合并文本含两行：' + JSON.stringify(mergedText));
+  const mergedRange = await page.$$eval('#cueTbody tr', trs => [
+    trs[0].querySelector('input[data-field="start"]').value,
+    trs[0].querySelector('input[data-field="end"]').value,
+  ]);
+  ok(mergedRange[0] === mergeTimes[0] && mergedRange[1] === mergeTimes[1],
+    '合并时间覆盖原区间：' + mergedRange.join(' ~ '));
+  const mergeNums = await page.$$eval('#cueTbody tr .c-num', els => els.slice(0, 3).map(e => e.textContent));
+  ok(mergeNums.join(',') === '1,2,3', '合并后编号重排：' + mergeNums.join(','));
+  ok(await page.locator('#cueTbody tr').last().locator('.op-merge').isDisabled(), '最后一条合并按钮禁用');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  ok(await page.locator('#cueTbody tr').count() === nMerge, '撤销合并');
+
+  // ---- 22. 批量重排预览 ----
+  console.log('22. 批量智能分行');
+  await page.locator('#btnRewrapAll').click();
+  await page.waitForTimeout(200);
+  ok(await page.locator('#rewrapModal').isVisible(), '批量重排预览出现');
+  const rwSummary = await page.locator('#rewrapSummary').textContent();
+  ok(/每行 18 字、最多 2 行/.test(rwSummary) && /将重排 \d+ 条/.test(rwSummary),
+    '预览汇总说明规则：' + rwSummary.trim().slice(0, 80));
+  const totalRows = await page.locator('#rewrapTbody tr').count();
+  ok(totalRows === 9, `预览覆盖全部 9 条（实际 ${totalRows}）`);
+  ok(await page.locator('#btnRewrapApply').isEnabled(), '存在变更时应用按钮可用');
+  const changed = await page.locator('#rewrapTbody tr .st-ok').count();
+  ok(changed > 0, `标记 ${changed} 条将重排`);
+  await page.locator('#btnRewrapApply').click();
+  await page.waitForTimeout(300);
+  ok(await page.locator('#rewrapModal').isHidden(), '应用后关闭预览');
+  const afterLayout = await page.locator('#problemSummary').textContent();
+  ok(!/超长行|超行数/.test(afterLayout), '应用后无超长行/超行数：' + afterLayout.trim().slice(0, 80));
+  // 草稿自动保存（接入既有草稿流程）
+  await page.waitForTimeout(1200);
+  ok((await page.locator('#draftInfo').textContent()).includes('草稿已保存'), '重排后自动保存草稿');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(200);
+  ok(/超长行/.test(await page.locator('#problemSummary').textContent()), '撤销批量重排恢复问题');
+  // 取消不修改
+  await page.locator('#btnRewrapAll').click();
+  await page.waitForTimeout(200);
+  await page.locator('#btnRewrapCancel').click();
+  await page.waitForTimeout(100);
+  ok(await page.locator('#rewrapModal').isHidden(), '取消关闭预览');
+
+  // ---- 23. 无法满足限制时说明原因且不删字 ----
+  console.log('23. 无法分行的原因');
+  const vttLong = [
+    'WEBVTT', '',
+    '00:00:01.000 --> 00:00:03.000',
+    'hello superlongincomprehensibleword',
+    '',
+  ].join('\n');
+  await page.locator('#fileInput').setInputFiles({ name: 'long.vtt', mimeType: 'text/vtt', buffer: Buffer.from(vttLong) });
+  await page.waitForTimeout(300);
+  await page.locator('#cueTbody tr').nth(0).locator('.op-rewrap').click();
+  await page.waitForTimeout(150);
+  const failStatus = await page.locator('#statusMsg').textContent();
+  ok(/英文单词/.test(failStatus) && /无法分行|不能拆开/.test(failStatus), '超长单词说明原因：' + failStatus);
+  const taKept = await page.locator('#cueTbody tr').nth(0).locator('textarea').inputValue();
+  ok(taKept === 'hello superlongincomprehensibleword', '失败时不删字不改写');
+  await page.locator('#btnRewrapAll').click();
+  await page.waitForTimeout(200);
+  const failCell = await page.locator('#rewrapTbody tr.rw-fail .rt-err').first().textContent();
+  ok(/英文单词/.test(failCell), '批量预览列出失败原因：' + failCell);
+  await page.locator('#btnRewrapCancel').click();
+
+  // ---- 24. VTT 拆分的 cue 标识与设置 ----
+  console.log('24. VTT 标识与设置');
+  const vttCue = [
+    'WEBVTT', '',
+    'intro-cue',
+    '00:00:01.000 --> 00:00:05.000 align:start position:20%',
+    '你好世界内容拆分测试文字',
+    '',
+  ].join('\n');
+  await page.locator('#fileInput').setInputFiles({ name: 'cue.vtt', mimeType: 'text/vtt', buffer: Buffer.from(vttCue) });
+  await page.waitForTimeout(300);
+  await page.evaluate(() => {
+    const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
+    ta.focus(); ta.setSelectionRange(4, 4);
+  });
+  await page.locator('#cueTbody tr').nth(0).locator('.op-split').click();
+  await page.waitForTimeout(200);
+  ok(await page.locator('#cueTbody tr').count() === 2, 'VTT 拆分成功');
+  const [dlVtt] = await Promise.all([
+    page.waitForEvent('download', { timeout: 5000 }),
+    page.locator('#btnExport').click(),
+  ]);
+  const splitVttOut = fs.readFileSync(await dlVtt.path(), 'utf-8');
+  ok(splitVttOut.startsWith('WEBVTT'), 'VTT 导出保留头部');
+  ok(splitVttOut.includes('intro-cue\n00:00:01.000 -->'), '前段保留 cue 标识符');
+  ok((splitVttOut.match(/align:start position:20%/g) || []).length === 2,
+    '前后两段均保留 cue 设置');
+  ok(!/^2$/m.test(splitVttOut.split('intro-cue')[1] || ''), '后段不写入自动编号');
+
   // ---- 控制台错误 ----
   const realErrors = errors.filter(e => !e.includes('favicon'));
   ok(realErrors.length === 0, '浏览器无 JS 错误' + (realErrors.length ? '：' + realErrors.join(' | ') : ''));

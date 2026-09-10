@@ -47,6 +47,10 @@
   <label>最短停留 <input type="number" id="setMinDur" min="100" max="10000" step="100"> ms</label>
   <label>最小间隔 <input type="number" id="setMinGap" min="0" max="2000" step="10"> ms</label>
   <label class="chk"><input type="checkbox" id="setOverlap"> 允许重叠</label>
+  <span class="rule-sep">|</span>
+  <label title="每行最多字符数（HTML 标签与空白不计）">每行字数 <input type="number" id="setMaxChars" min="2" max="120" step="1"></label>
+  <label title="每条字幕最多显示的行数">最多行数 <input type="number" id="setMaxLines" min="1" max="8" step="1"></label>
+  <button id="btnRewrapAll" class="accent" disabled title="按当前分行规则为全部字幕生成智能分行预览">批量重排…</button>
   <button id="btnAutoFix" class="accent" disabled>自动顺延…</button>
   <span id="fileInfo" class="muted grow"></span>
   <span id="draftInfo" class="muted"></span>
@@ -106,13 +110,13 @@
           <button id="btnZoomIn" title="放大">＋</button>
           <button id="btnFit" title="适配全部 (0)">适配</button>
         </span>
-        <span>滚轮缩放 · 拖动色块移动/调整边缘 · 拖动标尺移动播放头 · 空格播放</span>
+        <span>滚轮缩放 · 拖动色块移动/调整边缘 · 拖动标尺移动播放头 · 空格播放 · 文本框中 Ctrl+Enter 在光标处拆分</span>
       </div>
     </div>
     <div id="cueListWrap">
       <table id="cueTable">
         <thead>
-          <tr><th class="c-num">#</th><th>开始</th><th>结束</th><th>时长</th><th>语速</th><th class="c-text">文本</th></tr>
+          <tr><th class="c-num">#</th><th>开始</th><th>结束</th><th>时长</th><th>语速</th><th class="c-text">文本</th><th class="c-ops">编辑</th></tr>
         </thead>
         <tbody id="cueTbody"></tbody>
       </table>
@@ -133,6 +137,25 @@
     <ul id="problemList"></ul>
   </aside>
 </main>
+
+<div id="rewrapModal" class="hidden">
+  <div id="rewrapBox">
+    <h3>批量智能分行 — 重排预览</h3>
+    <p class="muted" id="rewrapSummary"></p>
+    <div id="rewrapTableWrap">
+      <table id="rewrapTable">
+        <thead>
+          <tr><th>#</th><th>原文</th><th>重排后 / 无法重排的原因</th><th>状态</th></tr>
+        </thead>
+        <tbody id="rewrapTbody"></tbody>
+      </table>
+    </div>
+    <div class="row-end">
+      <button id="btnRewrapCancel">取消</button>
+      <button id="btnRewrapApply" class="primary">应用重排</button>
+    </div>
+  </div>
+</div>
 
 <div id="diffModal" class="hidden">
   <div id="diffBox">
@@ -197,7 +220,7 @@
 <footer id="statusbar">
   <span id="statusMsg">就绪</span>
   <span class="grow"></span>
-  <span class="muted">快捷键：空格播放 · ←/→ 平移 · [ ] 起点 · ; ' 终点 · , . 吸附播放头 · Shift 大步 · Alt 小步 · Ctrl+Z/Y 撤销重做</span>
+  <span class="muted">快捷键：空格播放 · ←/→ 平移 · [ ] 起点 · ; ' 终点 · , . 吸附播放头 · Shift 大步 · Alt 小步 · 文本框 Ctrl+Enter 拆分 · Ctrl+Z/Y 撤销重做</span>
 </footer>
 
 <script src="/static/core.js"></script>

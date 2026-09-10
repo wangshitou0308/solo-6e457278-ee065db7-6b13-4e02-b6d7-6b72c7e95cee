@@ -24,6 +24,25 @@
   var diffModal = $('diffModal'), diffSummary = $('diffSummary'), diffTbody = $('diffTbody');
   var btnDiffCancel = $('btnDiffCancel'), btnDiffApply = $('btnDiffApply');
   var statusMsg = $('statusMsg');
+  // 媒体对照
+  var mediaBanner = $('mediaBanner'), mediaBannerText = $('mediaBannerText');
+  var btnMediaPick = $('btnMediaPick'), btnMediaDismiss = $('btnMediaDismiss');
+  var btnLoadMedia = $('btnLoadMedia'), mediaInput = $('mediaInput'), btnUnloadMedia = $('btnUnloadMedia');
+  var mediaState = $('mediaState'), mediaClock = $('mediaClock'), mediaRate = $('mediaRate');
+  var loopCueChk = $('loopCueChk'), loopPadBefore = $('loopPadBefore'), loopPadAfter = $('loopPadAfter');
+  var btnSnapStart = $('btnSnapStart'), btnSnapEnd = $('btnSnapEnd');
+  var btnMarkA1 = $('btnMarkA1'), btnMarkA2 = $('btnMarkA2'), btnAnchorSync = $('btnAnchorSync');
+  var nowCueText = $('nowCueText');
+  var mediaBox = $('mediaBox'), mediaVideo = $('mediaVideo');
+  var audioBadge = $('audioBadge'), audioName = $('audioName'), nowCueOverlay = $('nowCueOverlay');
+  var anchorModal = $('anchorModal'), anchorFormula = $('anchorFormula'), anchorError = $('anchorError');
+  var anchorDiffTbody = $('anchorDiffTbody');
+  var btnAnchorClose = $('btnAnchorClose'), btnAnchorApply = $('btnAnchorApply');
+  var btnClearA1 = $('btnClearA1'), btnClearA2 = $('btnClearA2');
+  var anchorCells = {
+    a1: { cue: $('a1Cue'), src: $('a1Src'), dst: $('a1Dst') },
+    a2: { cue: $('a2Cue'), src: $('a2Src'), dst: $('a2Dst') },
+  };
 
   var ctx = canvas.getContext('2d');
 
@@ -51,6 +70,12 @@
     dirty: false,
     pendingDraft: null,
     pendingChanges: null,
+    // 媒体对照（对象 URL 仅在浏览器内存中，绝不发送到服务器）
+    media: { url: null, name: null, isVideo: false, ready: false, duration: 0, pending: null },
+    rate: 1,
+    loop: { on: false, padBefore: 300, padAfter: 500 },
+    anchors: { a1: null, a2: null },   // {cue, num, srcTime, dstTime}
+    pendingSync: null,                  // 双锚点预览结果
   };
   var rowEls = [];        // 每行 DOM 缓存
   var activeRowIdx = -1;  // 播放头当前所在字幕行
@@ -69,6 +94,20 @@
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch];
     });
   }
+
+  // ---------- 播放头与媒体同步 ----------
+  // 统一入口：移动播放头时同步媒体进度（fromMedia 为 true 时表示时间来自媒体本身，避免回写）
+  function setPlayhead(ms, fromMedia) {
+    state.playheadMs = Math.max(0, ms);
+    if (state.media.ready && !fromMedia) {
+      var t = state.playheadMs / 1000;
+      if (Math.abs(mediaVideo.currentTime - t) > 0.04) mediaVideo.currentTime = t;
+    }
+    updatePlayUI();
+    drawCanvas();
+  }
+
+  function hasMedia() { return state.media.ready; }
 
   // ---------- 撤销 / 重做 ----------
   var lastUndoLabel = '', lastUndoTime = 0;
@@ -134,12 +173,16 @@
     state.fileName = fileName;
     state.fileKey = C.draftKey(fileName, text);
     state.selected = -1;
-    state.playheadMs = 0;
-    state.playing = false;
+    if (state.playing) setPlaying(false);
+    setPlayhead(0);
     state.undoStack.length = 0;
     state.redoStack.length = 0;
     state.dirty = false;
     state.pendingDraft = null;
+    state.anchors.a1 = null;
+    state.anchors.a2 = null;
+    state.loop.on = false;
+    loopCueChk.checked = false;
     lastUndoLabel = '';
     hideDraftBanner();
     fitAll();
@@ -149,6 +192,8 @@
     drawCanvas();
     updateUndoButtons();
     updateButtons();
+    updateSnapButtons();
+    updateAnchorButtons();
     setStatus('已载入 ' + fileName + '（' + doc.cues.length + ' 条，' + doc.format.toUpperCase() + '）');
     checkDraft();
   }
@@ -261,9 +306,19 @@
     if (!state.doc || i < 0 || i >= state.doc.cues.length) return;
     state.selected = i;
     markSelectedRow();
+    updateSnapButtons();
     if (opts.center) centerTimelineOn(state.doc.cues[i]);
     if (opts.scroll && rowEls[i]) rowEls[i].scrollIntoView({ block: 'nearest' });
     drawCanvas();
+  }
+
+  // 吸附 / 锚点按钮依赖选中状态
+  function updateSnapButtons() {
+    var can = !!state.doc && state.selected >= 0;
+    btnSnapStart.disabled = !can;
+    btnSnapEnd.disabled = !can;
+    btnMarkA1.disabled = !can;
+    btnMarkA2.disabled = !can;
   }
 
   // ---------- 分析 ----------
@@ -514,8 +569,7 @@
     var x = e.clientX - rect.left, y = e.clientY - rect.top;
     if (y < RULER_H) {
       drag = { mode: 'scrub', moved: false };
-      state.playheadMs = Math.max(0, xToTime(x));
-      updatePlayUI(); drawCanvas();
+      setPlayhead(xToTime(x));
       return;
     }
     var hit = hitTest(x, y);
@@ -538,8 +592,7 @@
     var dx = x - (drag.startX || 0);
     if (Math.abs(dx) > 2) drag.moved = true;
     if (drag.mode === 'scrub') {
-      state.playheadMs = Math.max(0, xToTime(x));
-      updatePlayUI(); drawCanvas();
+      setPlayhead(xToTime(x));
       return;
     }
     if (drag.mode === 'pan') {
@@ -603,8 +656,7 @@
     var rect = canvas.getBoundingClientRect();
     var hit = hitTest(e.clientX - rect.left, e.clientY - rect.top);
     if (hit) {
-      state.playheadMs = state.doc.cues[hit.idx].start;
-      updatePlayUI(); drawCanvas();
+      setPlayhead(state.doc.cues[hit.idx].start);
     }
   });
 
@@ -612,12 +664,16 @@
   btnZoomOut.addEventListener('click', function () { zoomAt(1 / 1.5, xToTime(cssW / 2)); });
   btnFit.addEventListener('click', function () { fitAll(); drawCanvas(); });
 
-  // ---------- 播放 ----------
+  // ---------- 播放（有媒体时驱动媒体，否则模拟播放头） ----------
   var rafId = null, lastTs = 0;
   function setPlaying(on) {
-    if (!state.doc) return;
+    if (on && !state.doc && !hasMedia()) return;
     state.playing = on;
     btnPlay.textContent = on ? '⏸ 暂停' : '▶ 播放';
+    if (hasMedia()) {
+      if (on) { mediaVideo.play().catch(function () { /* 忽略自动播放限制 */ }); }
+      else mediaVideo.pause();
+    }
     if (on) {
       lastTs = performance.now();
       rafId = requestAnimationFrame(tick);
@@ -626,15 +682,39 @@
       rafId = null;
     }
   }
+  // 单句循环区间（含前后留白），未开启或无选中时返回 null
+  function loopRange() {
+    if (!state.loop.on || !state.doc || state.selected < 0) return null;
+    var c = state.doc.cues[state.selected];
+    return {
+      start: Math.max(0, c.start - state.loop.padBefore),
+      end: c.end + state.loop.padAfter,
+    };
+  }
   function tick(ts) {
     if (!state.playing) return;
     var dt = ts - lastTs;
     lastTs = ts;
-    state.playheadMs += dt;
-    var end = docEnd();
-    if (state.playheadMs >= end + 800) {
-      state.playheadMs = end + 800;
-      setPlaying(false);
+    var lr = loopRange();
+    if (hasMedia()) {
+      // 媒体 → 播放头 / 时间轴 / 列表 / 预览
+      state.playheadMs = mediaVideo.currentTime * 1000;
+      if (lr && state.playheadMs >= lr.end) {
+        mediaVideo.currentTime = lr.start / 1000;
+        state.playheadMs = lr.start;
+      }
+    } else {
+      // 模拟播放头（倍速同样生效）
+      state.playheadMs += dt * state.rate;
+      if (lr && state.playheadMs >= lr.end) {
+        state.playheadMs = lr.start;
+      } else {
+        var end = docEnd();
+        if (state.playheadMs >= end + 800) {
+          state.playheadMs = end + 800;
+          setPlaying(false);
+        }
+      }
     }
     // 跟随播放头
     if (timeToX(state.playheadMs) > cssW - 40) {
@@ -648,6 +728,29 @@
   }
   function updatePlayUI() {
     playTime.textContent = C.fmtShort(state.playheadMs);
+    if (state.media.ready) {
+      mediaClock.textContent = C.fmtShort(state.playheadMs) + ' / ' + C.fmtShort(state.media.duration);
+    }
+    updateNowCue();
+  }
+  // 当前字幕预览（媒体条 + 视频叠加层）
+  var lastNowCue = null;
+  function updateNowCue() {
+    var txt = '';
+    if (state.doc) {
+      var list = state.doc.cues;
+      for (var i = 0; i < list.length; i++) {
+        if (state.playheadMs >= list[i].start && state.playheadMs < list[i].end) {
+          txt = list[i].lines.join(' ');
+          break;
+        }
+      }
+    }
+    if (txt === lastNowCue) return;
+    lastNowCue = txt;
+    nowCueText.textContent = txt || (state.doc ? '（播放头处无字幕）' : '');
+    nowCueText.classList.toggle('on', !!txt);
+    nowCueOverlay.textContent = txt;
   }
   function highlightActiveRow() {
     var idx = -1;
@@ -661,6 +764,271 @@
     activeRowIdx = idx;
   }
   btnPlay.addEventListener('click', function () { setPlaying(!state.playing); });
+
+  // ---------- 媒体载入 / 卸载（仅对象 URL，不上传、不入库） ----------
+  var MEDIA_MARK_KEY = 'subcal.media';   // localStorage 标记：刷新后提示重新选择媒体
+
+  btnLoadMedia.addEventListener('click', function () { mediaInput.click(); });
+  btnMediaPick.addEventListener('click', function () { mediaInput.click(); });
+  mediaInput.addEventListener('change', function () {
+    var f = mediaInput.files && mediaInput.files[0];
+    mediaInput.value = '';
+    if (f) loadMediaFile(f);
+  });
+
+  function loadMediaFile(f) {
+    if (state.media.pending) URL.revokeObjectURL(state.media.pending.url);
+    var url = URL.createObjectURL(f);
+    var isVideo = /^video\//.test(f.type) || /\.(mp4|webm|mkv|mov|m4v)$/i.test(f.name);
+    state.media.pending = { url: url, name: f.name, isVideo: isVideo };
+    mediaVideo.src = url;
+    mediaVideo.load();
+    setStatus('正在读取媒体《' + f.name + '》…');
+  }
+
+  mediaVideo.addEventListener('loadedmetadata', function () {
+    var p = state.media.pending;
+    if (!p) return;
+    if (state.media.url) URL.revokeObjectURL(state.media.url);   // 释放上一个对象 URL
+    state.media.url = p.url;
+    state.media.name = p.name;
+    state.media.isVideo = p.isVideo;
+    state.media.duration = (mediaVideo.duration || 0) * 1000;
+    state.media.ready = true;
+    state.media.pending = null;
+    mediaVideo.playbackRate = state.rate;
+    mediaBox.classList.remove('hidden');
+    mediaVideo.classList.toggle('hidden', !p.isVideo);
+    audioBadge.classList.toggle('hidden', p.isVideo);
+    audioName.textContent = p.name;
+    mediaState.textContent = p.name + ' · ' + (p.isVideo ? '视频' : '音频');
+    mediaClock.classList.remove('hidden');
+    btnUnloadMedia.classList.remove('hidden');
+    hideMediaBanner();
+    try { localStorage.setItem(MEDIA_MARK_KEY, JSON.stringify({ name: p.name })); } catch (e) {}
+    setPlayhead(0);
+    setStatus('已载入媒体《' + p.name + '》（仅本地对象 URL，不上传）。拖动播放头即可联动定位。');
+  });
+
+  mediaVideo.addEventListener('error', function () {
+    var p = state.media.pending;
+    if (!p) return;   // 卸载时清空 src 也会触发 error，忽略
+    URL.revokeObjectURL(p.url);
+    state.media.pending = null;
+    var name = p.name;
+    // 若此前已载入媒体，其 src 已被覆盖，一并复位到无媒体状态
+    if (state.media.ready || state.media.url) resetMediaState();
+    setStatus('无法解码媒体文件《' + name + '》，请换用浏览器支持的格式');
+  });
+
+  // 媒体元素自身状态变化 → 同步界面（如右键菜单控制、播放结束）
+  mediaVideo.addEventListener('play', function () { if (!state.playing) setPlaying(true); });
+  mediaVideo.addEventListener('pause', function () { if (state.playing) setPlaying(false); });
+  mediaVideo.addEventListener('ended', function () { if (state.playing) setPlaying(false); });
+  mediaVideo.addEventListener('seeked', function () {
+    if (!state.media.ready) return;
+    state.playheadMs = mediaVideo.currentTime * 1000;
+    updatePlayUI();
+    highlightActiveRow();
+    drawCanvas();
+  });
+
+  mediaBox.addEventListener('click', function () {
+    if (state.media.ready) setPlaying(!state.playing);
+  });
+
+  function resetMediaState() {
+    if (state.playing) setPlaying(false);
+    if (state.media.pending) {
+      URL.revokeObjectURL(state.media.pending.url);
+      state.media.pending = null;
+    }
+    if (state.media.url) URL.revokeObjectURL(state.media.url);
+    state.media = { url: null, name: null, isVideo: false, ready: false, duration: 0, pending: null };
+    mediaVideo.removeAttribute('src');
+    mediaVideo.load();
+    mediaBox.classList.add('hidden');
+    mediaClock.classList.add('hidden');
+    btnUnloadMedia.classList.add('hidden');
+    mediaState.textContent = '未载入媒体 · 模拟播放头';
+    try { localStorage.removeItem(MEDIA_MARK_KEY); } catch (e) {}
+    updatePlayUI();
+  }
+  btnUnloadMedia.addEventListener('click', function () {
+    resetMediaState();
+    setStatus('已卸载媒体，回到模拟播放头模式');
+  });
+
+  // 刷新后对象 URL 已失效：提示重新选择媒体（字幕编辑状态由草稿恢复）
+  function hideMediaBanner() { mediaBanner.classList.add('hidden'); }
+  btnMediaDismiss.addEventListener('click', function () {
+    try { localStorage.removeItem(MEDIA_MARK_KEY); } catch (e) {}
+    hideMediaBanner();
+  });
+  function checkMediaMark() {
+    var mark = null;
+    try { mark = JSON.parse(localStorage.getItem(MEDIA_MARK_KEY) || 'null'); } catch (e) {}
+    if (mark && mark.name) {
+      mediaBannerText.textContent =
+        '上次使用的媒体《' + mark.name + '》不会随页面保存，请重新选择媒体文件；字幕修改仍保留在本地草稿中。';
+      mediaBanner.classList.remove('hidden');
+    }
+  }
+
+  // ---------- 倍速 ----------
+  mediaRate.addEventListener('change', function () {
+    state.rate = parseFloat(mediaRate.value) || 1;
+    if (state.media.ready) mediaVideo.playbackRate = state.rate;
+    setStatus('播放倍速 ×' + state.rate);
+  });
+
+  // ---------- 单句循环（带前后留白） ----------
+  loopCueChk.addEventListener('change', function () {
+    if (loopCueChk.checked && (!state.doc || state.selected < 0)) {
+      loopCueChk.checked = false;
+      setStatus('请先选中一条字幕，再开启单句循环');
+      return;
+    }
+    state.loop.on = loopCueChk.checked;
+    if (state.loop.on) {
+      var lr = loopRange();
+      setPlayhead(lr.start);
+      setPlaying(true);
+      setStatus('单句循环 ' + C.fmtShort(lr.start) + ' ~ ' + C.fmtShort(lr.end) + '（含前后留白）');
+    } else {
+      setStatus('已关闭单句循环');
+    }
+  });
+  function saveLoopPads() {
+    state.loop.padBefore = clamp(+loopPadBefore.value || 0, 0, 5000);
+    state.loop.padAfter = clamp(+loopPadAfter.value || 0, 0, 5000);
+    loopPadBefore.value = state.loop.padBefore;
+    loopPadAfter.value = state.loop.padAfter;
+  }
+  loopPadBefore.addEventListener('change', saveLoopPads);
+  loopPadAfter.addEventListener('change', saveLoopPads);
+
+  // ---------- 吸附：选中字幕的起点/终点 → 当前播放头 ----------
+  function snapSelected(field) {
+    if (!state.doc || state.selected < 0) return;
+    var cue = state.doc.cues[state.selected];
+    var t = Math.round(state.playheadMs);
+    pushUndo('snap');
+    if (field === 'start') cue.start = clamp(t, 0, cue.end - MIN_DUR);
+    else cue.end = Math.max(t, cue.start + MIN_DUR);
+    fillRowTimes(state.selected);
+    afterChange('已将第 ' + cue.num + ' 条' + (field === 'start' ? '起点' : '终点') +
+      ' 吸附到播放头 ' + C.fmtMs(t, 'srt'));
+  }
+  btnSnapStart.addEventListener('click', function () { snapSelected('start'); });
+  btnSnapEnd.addEventListener('click', function () { snapSelected('end'); });
+
+  // ---------- 双锚点整体校时 ----------
+  function markAnchor(which) {
+    if (!state.doc || state.selected < 0) {
+      setStatus('请先选中一条字幕，再记录锚点');
+      return;
+    }
+    var cue = state.doc.cues[state.selected];
+    var a = {
+      cue: state.selected, num: cue.num,
+      srcTime: cue.start, dstTime: Math.round(state.playheadMs),
+    };
+    state.anchors[which] = a;
+    updateAnchorButtons();
+    setStatus('锚点' + (which === 'a1' ? '①' : '②') + '：第 ' + cue.num + ' 条起点 ' +
+      C.fmtMs(a.srcTime, 'srt') + ' ↔ 媒体时间 ' + C.fmtMs(a.dstTime, 'srt'));
+  }
+  btnMarkA1.addEventListener('click', function () { markAnchor('a1'); });
+  btnMarkA2.addEventListener('click', function () { markAnchor('a2'); });
+
+  function updateAnchorButtons() {
+    var n = (state.anchors.a1 ? 1 : 0) + (state.anchors.a2 ? 1 : 0);
+    btnAnchorSync.disabled = !state.doc;
+    btnAnchorSync.textContent = n ? '双锚点校时…（' + n + '/2）' : '双锚点校时…';
+  }
+
+  btnAnchorSync.addEventListener('click', function () {
+    if (!state.doc) return;
+    renderAnchorModal();
+    anchorModal.classList.remove('hidden');
+  });
+  function hideAnchor() {
+    anchorModal.classList.add('hidden');
+    state.pendingSync = null;
+  }
+  btnAnchorClose.addEventListener('click', hideAnchor);
+  anchorModal.addEventListener('click', function (e) { if (e.target === anchorModal) hideAnchor(); });
+  btnClearA1.addEventListener('click', function () {
+    state.anchors.a1 = null; updateAnchorButtons(); renderAnchorModal();
+  });
+  btnClearA2.addEventListener('click', function () {
+    state.anchors.a2 = null; updateAnchorButtons(); renderAnchorModal();
+  });
+
+  function renderAnchorModal() {
+    ['a1', 'a2'].forEach(function (k) {
+      var a = state.anchors[k], cells = anchorCells[k];
+      cells.cue.textContent = a ? ('#' + a.num) : '—';
+      cells.src.textContent = a ? C.fmtMs(a.srcTime, 'srt') : '—';
+      cells.dst.textContent = a ? C.fmtMs(a.dstTime, 'srt') : '—';
+    });
+    anchorFormula.textContent = '';
+    anchorError.textContent = '';
+    anchorDiffTbody.innerHTML = '';
+    state.pendingSync = null;
+    btnAnchorApply.disabled = true;
+    var a1 = state.anchors.a1, a2 = state.anchors.a2;
+    if (!a1 || !a2) {
+      anchorError.textContent = '还需记录锚点' + (!a1 ? '①' : '') + (!a2 ? '②' : '') +
+        '：选中字幕后，将播放头定位到该句在媒体中的实际位置，再点媒体条上的「记录锚点」按钮。';
+      return;
+    }
+    var res = C.computeAnchorSync(cues(), a1, a2);
+    if (res.error) {
+      anchorError.textContent = res.error;
+      return;
+    }
+    anchorFormula.textContent = '伸缩 ×' + res.a.toFixed(4) + ' · 偏移 ' +
+      (res.b >= 0 ? '+' : '−') + C.fmtMs(Math.abs(res.b), 'srt') +
+      ' · 将影响 ' + res.changes.length + ' / ' + cues().length + ' 条字幕';
+    if (!res.changes.length) {
+      anchorError.textContent = '变换后所有字幕时间不变，无需应用。';
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    res.changes.forEach(function (ch) {
+      var cue = state.doc.cues[ch.i];
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td class="mono">#' + esc(ch.num) + '</td>' +
+        '<td><span class="old mono">' + C.fmtMs(ch.oldStart, 'srt') + '</span> → <span class="new">' + C.fmtMs(ch.newStart, 'srt') + '</span></td>' +
+        '<td><span class="old mono">' + C.fmtMs(ch.oldEnd, 'srt') + '</span> → <span class="new">' + C.fmtMs(ch.newEnd, 'srt') + '</span></td>' +
+        '<td class="muted">' + esc(cue.lines.join(' / ')) + '</td>';
+      frag.appendChild(tr);
+    });
+    anchorDiffTbody.appendChild(frag);
+    state.pendingSync = res;
+    btnAnchorApply.disabled = false;
+  }
+
+  btnAnchorApply.addEventListener('click', function () {
+    var res = state.pendingSync;
+    if (!res || !state.doc) { hideAnchor(); return; }
+    pushUndo('anchorsync');
+    res.changes.forEach(function (ch) {
+      var cue = state.doc.cues[ch.i];
+      cue.start = ch.newStart;
+      cue.end = ch.newEnd;
+    });
+    hideAnchor();
+    // 时间已整体改写，原锚点失效
+    state.anchors.a1 = null;
+    state.anchors.a2 = null;
+    updateAnchorButtons();
+    renderList();
+    afterChange('已应用双锚点校时（' + res.changes.length + ' 条）');
+  });
 
   // ---------- 键盘 ----------
   function nudgeSelected(mode, dir, step) {
@@ -691,6 +1059,10 @@
       if (e.key === 'Escape') hideDiff();
       return;
     }
+    if (!anchorModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') hideAnchor();
+      return;
+    }
     var step = e.shiftKey ? 500 : (e.altKey ? 10 : 100);
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
       e.preventDefault();
@@ -716,6 +1088,8 @@
       case ']': nudgeSelected('start', 1, step); break;
       case ';': nudgeSelected('end', -1, step); break;
       case "'": nudgeSelected('end', 1, step); break;
+      case ',': snapSelected('start'); break;
+      case '.': snapSelected('end'); break;
       case '0': fitAll(); drawCanvas(); break;
       case 'ArrowUp':
         e.preventDefault();
@@ -991,6 +1365,10 @@
     loadSettings();
     updateButtons();
     updateUndoButtons();
+    updateSnapButtons();
+    updateAnchorButtons();
+    loopPadBefore.value = state.loop.padBefore;
+    loopPadAfter.value = state.loop.padAfter;
     resizeCanvas();
     if (window.ResizeObserver) {
       new ResizeObserver(resizeCanvas).observe(timelineWrap);
@@ -998,6 +1376,7 @@
       window.addEventListener('resize', resizeCanvas);
     }
     updatePlayUI();
+    checkMediaMark();
     // 首次启动自动载入内置示例，无需任何外部服务
     fetch('/api/sample')
       .then(function (r) { return r.json(); })

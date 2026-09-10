@@ -58,6 +58,44 @@
   <button id="btnDraftDismiss">忽略并删除</button>
 </div>
 
+<div id="mediaBanner" class="hidden">
+  <span id="mediaBannerText"></span>
+  <button id="btnMediaPick" class="accent">重新选择媒体</button>
+  <button id="btnMediaDismiss">知道了</button>
+</div>
+
+<section id="mediaBar">
+  <span class="label">媒体对照：</span>
+  <button id="btnLoadMedia" title="选择本地音频/视频（仅通过对象 URL 在浏览器内打开，不上传）">载入媒体…</button>
+  <input type="file" id="mediaInput" accept="audio/*,video/*,.mp3,.wav,.m4a,.ogg,.mp4,.webm,.mkv,.mov" hidden>
+  <button id="btnUnloadMedia" class="hidden" title="移除当前媒体并释放对象 URL">卸载</button>
+  <span id="mediaState" class="muted">未载入媒体 · 模拟播放头</span>
+  <span id="mediaClock" class="mono hidden"></span>
+  <label title="播放倍速（无媒体时同样生效）">倍速
+    <select id="mediaRate">
+      <option value="0.5">0.5×</option>
+      <option value="0.75">0.75×</option>
+      <option value="1" selected>1×</option>
+      <option value="1.25">1.25×</option>
+      <option value="1.5">1.5×</option>
+      <option value="2">2×</option>
+    </select>
+  </label>
+  <label class="chk" title="循环播放选中字幕（含前后留白）">
+    <input type="checkbox" id="loopCueChk"> 单句循环
+  </label>
+  <label title="循环区间向前/向后扩展的毫秒数">留白
+    <input type="number" id="loopPadBefore" min="0" max="5000" step="100"> /
+    <input type="number" id="loopPadAfter" min="0" max="5000" step="100"> ms
+  </label>
+  <button id="btnSnapStart" disabled title="将选中字幕的起点吸附到当前播放头 (,)">⇤ 起点吸附</button>
+  <button id="btnSnapEnd" disabled title="将选中字幕的终点吸附到当前播放头 (.)">终点吸附 ⇥</button>
+  <button id="btnMarkA1" disabled title="记录锚点①：选中字幕的起点 ↔ 当前播放头位置">记录锚点①</button>
+  <button id="btnMarkA2" disabled title="记录锚点②：选中字幕的起点 ↔ 当前播放头位置">记录锚点②</button>
+  <button id="btnAnchorSync" disabled title="根据两个锚点对全部字幕做线性校时">双锚点校时…</button>
+  <span id="nowCueText" class="muted grow"></span>
+</section>
+
 <main id="workspace">
   <section id="leftPane">
     <div id="timelineWrap">
@@ -86,6 +124,11 @@
   </section>
 
   <aside id="rightPane">
+    <div id="mediaBox" class="hidden" title="点击画面播放/暂停">
+      <video id="mediaVideo" playsinline preload="metadata"></video>
+      <div id="audioBadge" class="hidden">♪ <span id="audioName"></span></div>
+      <div id="nowCueOverlay"></div>
+    </div>
     <div id="problemSummary">未载入字幕</div>
     <ul id="problemList"></ul>
   </aside>
@@ -110,10 +153,51 @@
   </div>
 </div>
 
+<div id="anchorModal" class="hidden">
+  <div id="anchorBox">
+    <h3>双锚点整体校时</h3>
+    <p class="muted">
+      线性变换：新时间 = 伸缩 × 原时间 + 偏移。先选中字幕、把播放头定位到该句在媒体中的实际位置，
+      再点媒体条上的「记录锚点① / ②」采集两对时间；此处预览对全部字幕的影响，确认后批量应用。
+    </p>
+    <table id="anchorTable">
+      <thead>
+        <tr><th></th><th>字幕</th><th>原时间</th><th>媒体正确时间</th><th></th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono">锚点①</td><td id="a1Cue" class="mono">—</td>
+          <td id="a1Src" class="mono">—</td><td id="a1Dst" class="mono">—</td>
+          <td><button id="btnClearA1" class="mini">清除</button></td>
+        </tr>
+        <tr>
+          <td class="mono">锚点②</td><td id="a2Cue" class="mono">—</td>
+          <td id="a2Src" class="mono">—</td><td id="a2Dst" class="mono">—</td>
+          <td><button id="btnClearA2" class="mini">清除</button></td>
+        </tr>
+      </tbody>
+    </table>
+    <div id="anchorFormula" class="mono muted"></div>
+    <div id="anchorError"></div>
+    <div id="anchorDiffWrap">
+      <table id="anchorDiffTable">
+        <thead>
+          <tr><th>#</th><th>开始（前 → 后）</th><th>结束（前 → 后）</th><th>文本</th></tr>
+        </thead>
+        <tbody id="anchorDiffTbody"></tbody>
+      </table>
+    </div>
+    <div class="row-end">
+      <button id="btnAnchorClose">关闭</button>
+      <button id="btnAnchorApply" class="primary" disabled>应用校时</button>
+    </div>
+  </div>
+</div>
+
 <footer id="statusbar">
   <span id="statusMsg">就绪</span>
   <span class="grow"></span>
-  <span class="muted">快捷键：空格播放 · ←/→ 平移 · [ ] 起点 · ; ' 终点 · Shift 大步 · Alt 小步 · Ctrl+Z/Y 撤销重做</span>
+  <span class="muted">快捷键：空格播放 · ←/→ 平移 · [ ] 起点 · ; ' 终点 · , . 吸附播放头 · Shift 大步 · Alt 小步 · Ctrl+Z/Y 撤销重做</span>
 </footer>
 
 <script src="/static/core.js"></script>

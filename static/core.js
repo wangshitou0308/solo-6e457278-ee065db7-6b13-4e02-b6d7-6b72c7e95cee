@@ -198,6 +198,58 @@
     return changes;
   }
 
+  // ---------- 双锚点线性校时 ----------
+
+  // 锚点：{ cue, num, srcTime, dstTime }
+  //   srcTime 记录时刻字幕的原时间（ms），dstTime 该句在媒体中的正确时间（ms）。
+  // 由两对 (srcTime → dstTime) 确定线性变换 t' = a·t + b（a 为伸缩，b 为偏移），
+  // 返回 { a, b, changes:[{i,num,oldStart,oldEnd,newStart,newEnd}] }；
+  // 锚点冲突或变换产生负时间 / 倒序时返回 { error: '原因' }，不修改原数据。
+  function computeAnchorSync(cues, a1, a2) {
+    if (!a1 || !a2) return { error: '需要先后记录两个锚点' };
+    if (a1.srcTime === a2.srcTime) {
+      return {
+        error: '锚点冲突：两个锚点的原时间相同（均为 ' + fmtMs(a1.srcTime, 'srt') +
+          '），无法确定线性变换，请换用两条不同时间点的字幕',
+      };
+    }
+    const a = (a2.dstTime - a1.dstTime) / (a2.srcTime - a1.srcTime);
+    const b = a1.dstTime - a * a1.srcTime;
+    if (!isFinite(a) || a <= 0) {
+      return {
+        error: '锚点冲突：媒体正确时间的先后与原时间矛盾（伸缩系数 ' +
+          (isFinite(a) ? a.toFixed(4) : '∞') + ' ≤ 0），请检查两个锚点是否记反',
+      };
+    }
+    const changes = [];
+    for (let i = 0; i < cues.length; i++) {
+      const c = cues[i];
+      const ns = Math.round(a * c.start + b);
+      const ne = Math.round(a * c.end + b);
+      const label = '第 ' + (c.num || (i + 1)) + ' 条';
+      if (ns < 0 || ne < 0) {
+        return {
+          error: '禁止应用：' + label + ' 变换后出现负时间（' +
+            fmtMs(Math.min(ns, ne), 'srt') + '），请改用更靠后的锚点或减小偏移',
+        };
+      }
+      if (ne <= ns) {
+        return {
+          error: '禁止应用：' + label + ' 变换后结束时间不晚于开始时间（倒序为 ' +
+            fmtMs(ns, 'srt') + ' → ' + fmtMs(ne, 'srt') + '）',
+        };
+      }
+      if (ns !== c.start || ne !== c.end) {
+        changes.push({
+          i: i, num: c.num || String(i + 1),
+          oldStart: c.start, oldEnd: c.end,
+          newStart: ns, newEnd: ne,
+        });
+      }
+    }
+    return { a: a, b: b, changes: changes };
+  }
+
   // ---------- 草稿键 ----------
 
   // FNV-1a 简易哈希，用于生成草稿键
@@ -218,6 +270,7 @@
     parseTimecode: parseTimecode, fmtMs: fmtMs, fmtShort: fmtShort,
     detectFormat: detectFormat, parseSubtitle: parseSubtitle, serialize: serialize,
     countChars: countChars, cueCps: cueCps, analyze: analyze, computeAutoFix: computeAutoFix,
+    computeAnchorSync: computeAnchorSync,
     simpleHash: simpleHash, draftKey: draftKey,
   };
 });

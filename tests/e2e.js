@@ -1,5 +1,6 @@
 /* 浏览器端到端验证：载入示例 → 问题定位 → 自动顺延 → 撤销/重做 → 键盘微调 →
- * 搜索 → 拖拽 → 草稿恢复 → 导出。运行：node e2e.js */
+ * 搜索 → 拖拽 → 草稿恢复 → 导出 → 吸附/单句循环 → 双锚点校时 → 本地媒体对照 →
+ * 刷新媒体提示。运行：node e2e.js */
 'use strict';
 const { chromium } = require('playwright-core');
 
@@ -10,8 +11,24 @@ function ok(cond, label) {
   else { failed++; console.error('  ✗ FAIL:', label); }
 }
 
+// 生成测试用 WAV（16-bit 单声道正弦波），Chromium 可直接解码
+function makeWav(seconds, freq) {
+  const rate = 8000, n = Math.floor(seconds * rate), dataSize = n * 2;
+  const buf = Buffer.alloc(44 + dataSize);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + dataSize, 4); buf.write('WAVE', 8);
+  buf.write('fmt ', 12); buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(rate, 24); buf.writeUInt32LE(rate * 2, 28);
+  buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34);
+  buf.write('data', 36); buf.writeUInt32LE(dataSize, 40);
+  for (let i = 0; i < n; i++) {
+    buf.writeInt16LE(Math.round(Math.sin(2 * Math.PI * freq * i / rate) * 12000), 44 + i * 2);
+  }
+  return buf;
+}
+
 (async () => {
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });
   const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
   const errors = [];
   page.on('pageerror', e => errors.push('pageerror: ' + e.message));
@@ -201,6 +218,178 @@ function ok(cond, label) {
   ok(dl2.suggestedFilename().endsWith('.vtt'), 'VTT 导出扩展名正确');
   const vttOut = fs.readFileSync(await dl2.path(), 'utf-8');
   ok(vttOut.startsWith('WEBVTT'), 'VTT 导出保留头部');
+
+  // ---- 12. 吸附校时与单句循环（模拟播放头） ----
+  console.log('12. 吸附校时');
+  await page.locator('#btnSample').click();
+  await page.waitForTimeout(400);
+  if (await page.locator('#draftBanner').isVisible()) await page.locator('#btnDraftDismiss').click();
+  // 未选中字幕时开启单句循环应回弹
+  await page.locator('#loopCueChk').click();
+  await page.waitForTimeout(100);
+  ok(!(await page.locator('#loopCueChk').isChecked()), '未选中字幕时单句循环回弹');
+
+  // 视图复位后按时间点击标尺定位播放头（复刻 fitAll 的视图计算）
+  async function docEndMs() {
+    return await page.evaluate(() => {
+      const rows = document.querySelectorAll('#cueTbody tr');
+      const v = rows[rows.length - 1].querySelector('input[data-field="end"]').value;
+      const m = v.match(/(\d+):(\d+):(\d+),(\d+)/);
+      return ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 + +m[4];
+    });
+  }
+  async function setPlayhead(t) {
+    await page.locator('#btnFit').click();
+    await page.waitForTimeout(80);
+    const box = await page.locator('#timeline').boundingBox();
+    const end = await docEndMs();
+    const pad = Math.max(end * 0.04, 500);
+    const x = (t + pad) * (box.width / (end + pad * 2));
+    await page.mouse.click(box.x + x, box.y + 10);
+    await page.waitForTimeout(80);
+  }
+  async function rowTime(row, field) {
+    const v = await page.locator('#cueTbody tr').nth(row).locator(`input[data-field="${field}"]`).inputValue();
+    const m = v.match(/(\d+):(\d+):(\d+),(\d+)/);
+    return ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 + +m[4];
+  }
+
+  await page.locator('#cueTbody tr').nth(1).click();   // 选中第 2 条（2850–3000）
+  await setPlayhead(2500);
+  await page.locator('#btnSnapStart').click();
+  const snappedStart = await rowTime(1, 'start');
+  ok(Math.abs(snappedStart - 2500) < 120, `起点吸附到播放头（${snappedStart} ≈ 2500）`);
+  await page.waitForTimeout(900);   // 超过撤销合并窗口
+  await setPlayhead(5000);
+  await page.locator('#btnSnapEnd').click();
+  const snappedEnd = await rowTime(1, 'end');
+  ok(Math.abs(snappedEnd - 5000) < 120, `终点吸附到播放头（${snappedEnd} ≈ 5000）`);
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  ok(Math.abs((await rowTime(1, 'end')) - 3000) < 2, '撤销终点吸附');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  ok(Math.abs((await rowTime(1, 'start')) - 2850) < 2, '撤销起点吸附');
+  // 快捷键吸附
+  await page.waitForTimeout(900);
+  await setPlayhead(2500);
+  await page.keyboard.press(',');
+  await page.waitForTimeout(120);
+  ok(Math.abs((await rowTime(1, 'start')) - 2500) < 120, '快捷键 , 吸附起点');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+
+  // ---- 13. 单句循环（模拟模式） ----
+  console.log('13. 单句循环');
+  await page.locator('#cueTbody tr').first().click();  // 第 1 条 500–2800，循环区间 200–3300
+  await page.locator('#loopCueChk').click();
+  await page.waitForTimeout(100);
+  ok(await page.locator('#loopCueChk').isChecked(), '选中后可开启单句循环');
+  ok((await page.locator('#btnPlay').textContent()).includes('暂停'), '循环开启后自动播放');
+  await page.waitForTimeout(600);
+  const loopTime = await page.locator('#playTime').textContent();
+  ok(loopTime !== '00:00.0', '循环播放中（' + loopTime + '）');
+  await page.locator('#loopCueChk').click();
+  await page.locator('#btnPlay').click();   // 停止
+  await page.waitForTimeout(100);
+
+  // ---- 14. 双锚点整体校时 ----
+  console.log('14. 双锚点整体校时');
+  await page.locator('#btnAnchorSync').click();
+  await page.waitForTimeout(150);
+  ok(await page.locator('#anchorModal').isVisible(), '校时弹窗打开');
+  ok((await page.locator('#anchorError').textContent()).includes('还需记录锚点'), '提示缺少锚点');
+  ok(await page.locator('#btnAnchorApply').isDisabled(), '缺锚点时应用禁用');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(100);
+  // 锚点①：第 1 条起点 500 → 播放头 1500
+  await page.locator('#cueTbody tr').first().click();
+  await setPlayhead(1500);
+  await page.locator('#btnMarkA1').click();
+  ok((await page.locator('#statusMsg').textContent()).includes('锚点①'), '记录锚点①');
+  // 锚点②与①为同一条字幕 → 原时间相同 → 冲突
+  await setPlayhead(2500);
+  await page.locator('#btnMarkA2').click();
+  await page.locator('#btnAnchorSync').click();
+  await page.waitForTimeout(150);
+  ok((await page.locator('#anchorError').textContent()).includes('锚点冲突'), '原时间相同报锚点冲突');
+  ok(await page.locator('#btnAnchorApply').isDisabled(), '冲突时应用禁用');
+  await page.locator('#btnClearA2').click();
+  await page.waitForTimeout(100);
+  ok((await page.locator('#anchorError').textContent()).includes('还需记录锚点②'), '清除锚点②后提示缺少');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(100);
+  // 正常：锚点② = 第 3 条起点 2950 → 播放头 4000（整体约 +1000ms 并轻微伸缩）
+  await page.locator('#cueTbody tr').nth(2).click();
+  await setPlayhead(4000);
+  await page.locator('#btnMarkA2').click();
+  await page.locator('#btnAnchorSync').click();
+  await page.waitForTimeout(150);
+  const formula = await page.locator('#anchorFormula').textContent();
+  ok(/伸缩 ×1\.\d+/.test(formula) && formula.includes('偏移'), '显示变换公式：' + formula.trim());
+  const syncRows = await page.locator('#anchorDiffTbody tr').count();
+  ok(syncRows === 9, `预览全部 9 条差异（实际 ${syncRows}）`);
+  ok(await page.locator('#btnAnchorApply').isEnabled(), '应用按钮可用');
+  await page.locator('#btnAnchorApply').click();
+  await page.waitForTimeout(300);
+  const synced = await rowTime(0, 'start');
+  ok(Math.abs(synced - 1500) < 150, `锚点校时应用（第 1 条 ${synced} ≈ 1500）`);
+  ok((await page.locator('#statusMsg').textContent()).includes('双锚点校时'), '状态提示已应用');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(200);
+  ok((await rowTime(0, 'start')) === 500, '撤销锚点校时恢复原时间');
+  // 负时间：锚点 2850→0 与 2950→100 使第 1 条变为负
+  await page.locator('#cueTbody tr').nth(1).click();
+  await setPlayhead(0);
+  await page.locator('#btnMarkA1').click();
+  await page.locator('#cueTbody tr').nth(2).click();
+  await setPlayhead(100);
+  await page.locator('#btnMarkA2').click();
+  await page.locator('#btnAnchorSync').click();
+  await page.waitForTimeout(150);
+  ok((await page.locator('#anchorError').textContent()).includes('负时间'), '产生负时间时禁止并说明');
+  ok(await page.locator('#btnAnchorApply').isDisabled(), '负时间时应用禁用');
+  await page.locator('#btnClearA1').click();
+  await page.locator('#btnClearA2').click();
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(100);
+
+  // ---- 15. 本地媒体对照（WAV 对象 URL） ----
+  console.log('15. 本地媒体对照');
+  await page.locator('#mediaInput').setInputFiles({ name: 'test-tone.wav', mimeType: 'audio/wav', buffer: makeWav(4, 440) });
+  await page.waitForFunction(
+    () => document.getElementById('mediaState').textContent.includes('test-tone.wav'), null, { timeout: 5000 });
+  ok(true, '媒体载入并显示文件名');
+  ok(await page.locator('#mediaBox').isVisible(), '媒体区显示');
+  ok(await page.locator('#audioBadge').isVisible(), '音频标识显示');
+  const clock = await page.locator('#mediaClock').textContent();
+  ok(clock.includes('/ 00:04.0'), '媒体时长显示：' + clock.trim());
+  await page.locator('#btnPlay').click();
+  await page.waitForTimeout(700);
+  const mt = await page.locator('#playTime').textContent();
+  ok(mt !== '00:00.0', '媒体驱动播放头（' + mt + '）');
+  await page.locator('#btnPlay').click();
+  await setPlayhead(2000);
+  const mediaPos = await page.evaluate(() => document.getElementById('mediaVideo').currentTime);
+  ok(Math.abs(mediaPos - 2) < 0.3, '播放头定位媒体（' + mediaPos.toFixed(2) + 's ≈ 2s）');
+  await page.locator('#mediaRate').selectOption('2');
+  const rate = await page.evaluate(() => document.getElementById('mediaVideo').playbackRate);
+  ok(rate === 2, '倍速作用于媒体元素');
+  await page.locator('#mediaRate').selectOption('1');
+
+  // ---- 16. 刷新后提示重新选择媒体 ----
+  console.log('16. 刷新媒体提示');
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForFunction(() => document.querySelectorAll('#cueTbody tr').length > 0, null, { timeout: 5000 });
+  await page.waitForTimeout(400);
+  ok(await page.locator('#mediaBanner').isVisible(), '刷新后提示重新选择媒体');
+  ok((await page.locator('#mediaState').textContent()).includes('模拟播放头'), '刷新后回到模拟播放头');
+  ok(await page.locator('#draftBanner').isVisible(), '字幕草稿提示仍独立存在');
+  await page.locator('#btnMediaDismiss').click();
+  await page.waitForTimeout(100);
+  ok(await page.locator('#mediaBanner').isHidden(), '关闭媒体提示');
+  await page.locator('#btnDraftDismiss').click();   // 清理草稿，避免影响后续运行
+  await page.waitForTimeout(200);
 
   // ---- 控制台错误 ----
   const realErrors = errors.filter(e => !e.includes('favicon'));

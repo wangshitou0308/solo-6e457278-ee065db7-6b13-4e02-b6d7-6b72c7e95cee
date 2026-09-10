@@ -92,5 +92,70 @@ eq(Core.computeAutoFix(fixed, settings), [], '已合规则无变更');
 eq(Core.draftKey('a.srt', 'hello'), Core.draftKey('a.srt', 'hello'), '草稿键稳定');
 ok(Core.draftKey('a.srt', 'hello') !== Core.draftKey('a.srt', 'hellp'), '草稿键随内容变化');
 
+// ---- 双锚点线性校时 ----
+const syncCues = [
+  { num: '1', start: 1000, end: 2000, lines: ['一'] },
+  { num: '2', start: 3000, end: 4000, lines: ['二'] },
+  { num: '3', start: 5000, end: 6000, lines: ['三'] },
+];
+// 纯偏移：整体 +500ms
+let r = Core.computeAnchorSync(syncCues,
+  { cue: 0, num: '1', srcTime: 1000, dstTime: 1500 },
+  { cue: 2, num: '3', srcTime: 5000, dstTime: 5500 });
+eq(r.error, undefined, '纯偏移无错误');
+eq(r.a, 1, '纯偏移伸缩系数为 1');
+eq(r.b, 500, '纯偏移偏移量 +500');
+eq(r.changes.length, 3, '纯偏移影响全部 3 条');
+eq([r.changes[0].newStart, r.changes[0].newEnd], [1500, 2500], '纯偏移首条结果');
+// 伸缩 + 偏移：t' = 2t + 1000
+r = Core.computeAnchorSync(syncCues,
+  { cue: 0, num: '1', srcTime: 1000, dstTime: 3000 },
+  { cue: 2, num: '3', srcTime: 5000, dstTime: 11000 });
+eq(r.error, undefined, '伸缩无错误');
+eq(r.a, 2, '伸缩系数 2');
+eq(r.b, 1000, '伸缩偏移 +1000');
+eq([r.changes[1].newStart, r.changes[1].newEnd], [7000, 9000], '伸缩中间条结果');
+// 锚点应用后顺序保持
+{
+  const out = syncCues.map(c => ({ ...c }));
+  r.changes.forEach(ch => { out[ch.i].start = ch.newStart; out[ch.i].end = ch.newEnd; });
+  ok(out.every(c => c.end > c.start), '伸缩后各条不倒序');
+}
+// 锚点冲突：原时间相同
+r = Core.computeAnchorSync(syncCues,
+  { cue: 0, num: '1', srcTime: 1000, dstTime: 1500 },
+  { cue: 1, num: '2', srcTime: 1000, dstTime: 2000 });
+ok(/锚点冲突/.test(r.error), '原时间相同报锚点冲突');
+// 锚点冲突：媒体时间顺序与原时间矛盾（a < 0）
+r = Core.computeAnchorSync(syncCues,
+  { cue: 0, num: '1', srcTime: 1000, dstTime: 9000 },
+  { cue: 2, num: '3', srcTime: 5000, dstTime: 3000 });
+ok(/锚点冲突/.test(r.error) && /记反/.test(r.error), '顺序矛盾报锚点冲突');
+// 媒体时间相同（a = 0）同样禁止
+r = Core.computeAnchorSync(syncCues,
+  { cue: 0, num: '1', srcTime: 1000, dstTime: 5000 },
+  { cue: 2, num: '3', srcTime: 5000, dstTime: 5000 });
+ok(/锚点冲突/.test(r.error), '媒体时间相同（伸缩为 0）禁止');
+// 负时间：t' = 0.5t - 1000，首条 1000ms → -500ms
+r = Core.computeAnchorSync(syncCues,
+  { cue: 1, num: '2', srcTime: 3000, dstTime: 500 },
+  { cue: 2, num: '3', srcTime: 5000, dstTime: 1500 });
+ok(/负时间/.test(r.error), '产生负时间禁止应用');
+// 倒序：原数据本身 start >= end 时变换后仍倒序
+const badCues = [{ num: '1', start: 2000, end: 2000, lines: ['x'] }];
+r = Core.computeAnchorSync(badCues,
+  { cue: 0, num: '1', srcTime: 2000, dstTime: 3000 },
+  { cue: 0, num: '1', srcTime: 4000, dstTime: 6000 });
+ok(/倒序/.test(r.error), '变换后倒序禁止应用');
+// 缺少锚点
+r = Core.computeAnchorSync(syncCues, { cue: 0, num: '1', srcTime: 1000, dstTime: 1500 }, null);
+ok(/两个锚点/.test(r.error), '缺锚点时报错');
+// 变换后无变化：changes 为空但无错误
+r = Core.computeAnchorSync(syncCues,
+  { cue: 0, num: '1', srcTime: 1000, dstTime: 1000 },
+  { cue: 2, num: '3', srcTime: 5000, dstTime: 5000 });
+eq(r.error, undefined, '恒等变换无错误');
+eq(r.changes, [], '恒等变换无变更');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

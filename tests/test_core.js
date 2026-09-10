@@ -278,6 +278,11 @@ ok(Core.displayWidth('hello') === 5, '西文行宽 1/字符');
 ok(Core.displayWidth('你好') === 2, '中文行宽 1/字符');
 ok(Core.displayWidth('a b') === 2, '空白不计行宽');
 ok(Core.displayWidth('<i>你好</i>') === 2, '标签不计行宽');
+// 标点悬挂：仅行末一个句末标点超宽 1 字时不算超长行
+const hangProbs = Core.analyzeCueLayout({ lines: ['一二三四，', '五'] }, 4, 2);
+eq(hangProbs, [], '行末悬挂标点豁免超长行');
+const realLongProbs = Core.analyzeCueLayout({ lines: ['一二三四五六'] }, 4, 2);
+ok(realLongProbs.some(p => p.type === 'longline'), '真正超长仍报超长行');
 
 // ---- 智能分行：单条 ----
 function rw(lines, maxChars, maxLines) {
@@ -354,6 +359,42 @@ eq(rw(['一二三四五六七八九十一二三四五六七八九'], 10, 2).line
   const out = Core.rewrapCue(cue, 10, 2);
   eq(out.ok, true, '已合规则分行成功');
   eq(out.lines.join('|'), '一二三四|五六七八', '已合规则保持原样');
+}
+{
+  // 不得制造新的孤立标点：「一二三四，五」每行 4 字
+  const out = rw(['一二三四，五'], 4, 2);
+  eq(out.ok, true, '可行分行成功');
+  eq(out.lines.length, 2, '排为 2 行');
+  ok(!out.lines.some(l => /^[,.;:!?，。；：！？、…）】》]/.test(l)),
+    '结果无孤立标点行首：' + JSON.stringify(out.lines));
+  eq(out.lines.join(''), '一二三四，五', '不删字且顺序不变');
+  // 必须断在逗号之后：一二三四，| 五
+  eq(out.lines[0], '一二三四，', '断点选在标点之后');
+}
+{
+  // 原手工换行造成的孤立标点，重排时应消除
+  const out = rw(['一二三', '，四五'], 10, 2);
+  eq(out.ok, true, '含既有孤立标点仍可重排');
+  ok(!out.lines.some(l => /^，/.test(l)), '消除既有孤立标点：' + JSON.stringify(out.lines));
+}
+{
+  // 无法在不制造孤立标点的前提下满足宽度 → 明确报错且不删字
+  // 「二三四五，」后接「六七八九零」：每行 4、最多 2 行，任何可行断点都会让标点或长行出现
+  const out = rw(['二三四五六七八，九零'], 4, 2);
+  if (out.ok) {
+    ok(out.lines.every(l => Core.displayWidth(l) <= 4), '若成功则每行不超 4 字');
+    ok(!out.lines.some(l => /^，/.test(l)), '若成功则无孤立标点：' + JSON.stringify(out.lines));
+  } else {
+    ok(/不删字|孤立|放宽/.test(out.error), '无法满足时说明原因：' + out.error);
+  }
+  const cue = { num: '1', start: 0, end: 1, settings: '', lines: ['二三四五六七八，九零'] };
+  eq(Core.effectiveLength(cue.lines.join('')), 10, '报错路径输入未被修改');
+}
+{
+  // 西文标点同理：不能把逗号/句号放到下一行行首
+  const out = rw(['one two, three'], 8, 3);
+  eq(out.ok, true, '西文分行成功');
+  ok(!out.lines.some(l => /^[,.;!?]/.test(l)), '西文结果无行首孤立标点：' + JSON.stringify(out.lines));
 }
 
 // ---- 批量重排计划 ----

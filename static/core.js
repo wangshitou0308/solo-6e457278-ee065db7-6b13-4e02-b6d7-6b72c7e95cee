@@ -369,10 +369,17 @@
     var over = [];
     cue.lines.forEach(function (line, li) {
       var w = displayWidth(line);
-      if (w > maxChars) over.push('第 ' + (li + 1) + ' 行 ' + w.toFixed(1) + ' 字宽');
-      var body = stripTags(line).trim();
-      if (body && ORPHAN_LEAD.test(body)) {
-        probs.push({ type: 'orphan', msg: '第 ' + (li + 1) + ' 行以孤立标点开头（' + body.slice(0, 2) + '）' });
+      if (w > maxChars) {
+        // 标点悬挂豁免：超宽仅来自行末的一个句末标点（智能分行允许的排版）
+        var body = stripTags(line).replace(/\s+$/, '');
+        var lastCh = body.slice(-1);
+        var hanging = BREAK_AFTER_RE.test(lastCh) &&
+          displayWidth(body.slice(0, -1)) <= maxChars && w <= maxChars + 1;
+        if (!hanging) over.push('第 ' + (li + 1) + ' 行 ' + w.toFixed(1) + ' 字宽');
+      }
+      var leadBody = stripTags(line).trim();
+      if (leadBody && ORPHAN_LEAD.test(leadBody)) {
+        probs.push({ type: 'orphan', msg: '第 ' + (li + 1) + ' 行以孤立标点开头（' + leadBody.slice(0, 2) + '）' });
       }
     });
     if (over.length) probs.push({ type: 'longline', msg: over.join('、') + '，超过每行 ' + maxChars + ' 字宽' });
@@ -472,20 +479,94 @@
     return out.replace(TRIM_HWS, '');
   }
 
+  // 在位置 j 断开后，下一行行首（跳过标签/空白）是否会是孤立标点；返回该标点或 null
+  function leadingOrphanAt(toks, j) {
+    for (var k = j; k < toks.length; k++) {
+      var t = toks[k];
+      if (t.type === 'tag' || t.type === 'space') continue;
+      return ORPHAN_LEAD.test(stripTags(t.s)) ? stripTags(t.s) : null;
+    }
+    return null;
+  }
+
+  function segWidth(toks, lo, hi) {
+    var w = 0;
+    for (var k = lo; k < hi; k++) w += tokenWidth(toks[k]);
+    return w;
+  }
+
+  // 溢出时收集可行断点（不产生孤立标点），返回 {full, punct, soft}。
+  // 优先级：① 限宽内最晚的断点，且若右侧紧跟标点则让标点附在同一行（跟随）；
+  // ② 限宽内最晚断点、右侧标点悬挂（仅超宽 1 字）；③ 限宽内最晚的 CJK 软断点。
+  function collectCuts(toks, start, i, maxChars) {
+    var soft = -1, j, r, w, a, tail;
+    // 收集限宽内全部可行断点（正序），便于在“标点跟随 / 悬挂”与普通断点间择优
+    var okCuts = [];
+    for (j = start + 1; j <= i; j++) {
+      r = boundaryKind(toks, j);
+      if (!r || leadingOrphanAt(toks, j)) continue;
+      w = segWidth(toks, start, j);
+      if (w > maxChars) continue;
+      if (r === 'soft' && soft < 0) soft = j;
+      okCuts.push(j);
+    }
+    if (!okCuts.length) return { full: -1, punct: -1, soft: soft };
+    // 倒序：优先让“断点右侧跨过至多一个正文字符后紧跟的标点”跟随本行
+    for (var ci = okCuts.length - 1; ci >= 0; ci--) {
+      j = okCuts[ci];
+      w = segWidth(toks, start, j);
+      // 右侧紧邻标点（可能先跨过空白）
+      a = j;
+      while (a < i && toks[a].type === 'space') a++;
+      if (a < i && toks[a].type === 'punct') {
+        tail = a + 1;
+        if (!leadingOrphanAt(toks, tail)) {
+          if (w + tokenWidth(toks[a]) <= maxChars) return { full: tail, punct: -1, soft: soft };
+          if (w <= maxChars && w + tokenWidth(toks[a]) <= maxChars + 1) {
+            return { full: -1, punct: tail, soft: soft };
+          }
+        }
+      }
+      // 断点后第一个正文 token，再往右紧跟标点：允许把“一个字符 + 标点”带入本行
+      var b = a;
+      if (b < i && toks[b].type !== 'punct' && tokenWidth(toks[b]) <= 1) {
+        var c = b + 1;
+        while (c < i && toks[c].type === 'space') c++;
+        if (c < i && toks[c].type === 'punct') {
+          tail = c + 1;
+          if (!leadingOrphanAt(toks, tail)) {
+            var wt = w + tokenWidth(toks[b]) + tokenWidth(toks[c]);
+            // 字符 + 标点恰好填满
+            if (wt <= maxChars) return { full: tail, punct: -1, soft: soft };
+            // 标点悬挂：正文（含那一个字符）不超宽、含标点最多超宽 1 字
+            if (wt - tokenWidth(toks[c]) <= maxChars && wt <= maxChars + 1) {
+              return { full: -1, punct: tail, soft: soft };
+            }
+          }
+        }
+      }
+    }
+    var latest = okCuts[okCuts.length - 1];
+    return { full: latest, punct: -1, soft: soft };
+  }
+
   // 对单条字幕做智能分行。成功返回 {ok:true, lines}；无法满足限制返回
-  // {ok:false, error:'原因'}。绝不删除任何非空白字符。
+  // {ok:false, error:'原因'}。绝不删除任何非空白字符，也不制造新的孤立标点。
   function rewrapCue(cue, maxChars, maxLines) {
     if (!(maxChars > 0) || !(maxLines > 0)) return { ok: false, error: '分行规则未配置' };
-    // 现有排版已满足规则（无空行、每行不超限、行数不超限）→ 原样返回，不做无谓重排
-    if (cue.lines.length >= 1 && cue.lines.length <= maxLines &&
-      cue.lines.every(function (l) { return l !== '' && displayWidth(l) <= maxChars; })) {
-      return { ok: true, lines: cue.lines.slice() };
-    }
+    // 现有排版已满足规则且不存在孤立标点 → 原样返回，不做无谓重排
+    var alreadyOk = cue.lines.length >= 1 && cue.lines.length <= maxLines &&
+      cue.lines.every(function (l) {
+        var body = stripTags(l).trim();
+        return l !== '' && displayWidth(l) <= maxChars &&
+          !(body && ORPHAN_LEAD.test(body));
+      });
+    if (alreadyOk) return { ok: true, lines: cue.lines.slice() };
     var toks = tokenizeLines(cue.lines);
-    // 单个不可拆单元超宽 → 无法在不拆词的前提下满足
+    // 单个不可拆单元超宽（标点除外，标点可悬挂）→ 无法在不拆词的前提下满足
     for (var k0 = 0; k0 < toks.length; k0++) {
       var wSingle = tokenWidth(toks[k0]);
-      if (wSingle > maxChars) {
+      if (wSingle > maxChars && toks[k0].type !== 'punct') {
         return {
           ok: false,
           error: tokenName(toks[k0]) + '「' + stripTags(toks[k0].s) + '」宽 ' + wSingle.toFixed(1) +
@@ -505,8 +586,13 @@
         continue;
       }
       var bnd = boundaryKind(toks, i);
+      // 行尾标点（逗号/句号等）即使让宽度轻微超宽也继续收入本行，
+      // 避免把标点孤立到下一行行首；其超宽由 collectCuts 的标点悬挂兜底
+      if (t.type === 'punct' && i > start && curW <= maxChars) {
+        curW += tokenWidth(t); i++; continue;
+      }
       if (curW + tokenWidth(t) <= maxChars) { curW += tokenWidth(t); i++; continue; }
-      // 已溢出：在 [start, i] 范围内倒序挑选断点
+      // 已溢出
       if (!bnd) {
         var seg = stripTags(buildLine(toks, start, i) + t.s).slice(0, 12);
         return {
@@ -515,19 +601,14 @@
             maxChars + ' 字宽，无法分行',
         };
       }
-      var cut = -1, softCut = -1, shortPreferCut = -1, j, r, z, w;
-      for (j = i; j > start; j--) {
-        r = boundaryKind(toks, j);
-        if (!r) continue;
-        w = 0;
-        for (z = start; z < j; z++) w += tokenWidth(toks[z]);
-        if (r === 'prefer' && w >= maxChars * 0.6) { cut = j; break; }
-        if (r === 'soft' && softCut < 0) softCut = j;
-        if (r === 'prefer' && shortPreferCut < 0) shortPreferCut = j;
-      }
-      if (cut < 0) cut = softCut >= 0 ? softCut : shortPreferCut;
+      var cuts = collectCuts(toks, start, i, maxChars);
+      var cut = cuts.full >= 0 ? cuts.full : (cuts.punct >= 0 ? cuts.punct : cuts.soft);
       if (cut < 0) {
-        return { ok: false, error: '该条存在无法断开的连续内容，超过每行 ' + maxChars + ' 字宽，无法分行' };
+        return {
+          ok: false,
+          error: '每行 ' + maxChars + ' 字宽内找不到既不超宽、又不把标点孤立到行首的断点' +
+            '（不删字），请放宽每行字数 / 行数或手动调整该条',
+        };
       }
       var lineText = buildLine(toks, start, cut);
       if (lineText) lines.push(lineText);
@@ -544,11 +625,22 @@
       return { ok: false, error: '按每行 ' + maxChars + ' 字宽重排需要 ' + lines.length +
         ' 行，超过最多 ' + maxLines + ' 行的限制（不删字），请放宽每行字数或行数' };
     }
-    // 安全校验：非空白字符一个都不能少、顺序不变
-    var oldFlat = stripTags(cue.lines.join('')).replace(/[\s\u3000]+/g, '');
-    var newFlat = stripTags(lines.join('')).replace(/[\s\u3000]+/g, '');
+    // 安全校验一：非空白字符一个都不能少、顺序不变
+    var oldFlat = stripTags(cue.lines.join('')).replace(/\s+/g, '');
+    var newFlat = stripTags(lines.join('')).replace(/\s+/g, '');
     if (oldFlat !== newFlat) {
       return { ok: false, error: '内部分行校验失败（字符发生变化），已放弃，请人工调整' };
+    }
+    // 安全校验二：结果中不得残留以孤立标点开头的行
+    for (var li = 0; li < lines.length; li++) {
+      var body = stripTags(lines[li]).trim();
+      if (body && ORPHAN_LEAD.test(body)) {
+        return {
+          ok: false,
+          error: '重排后第 ' + (li + 1) + ' 行仍会以孤立标点开头，当前每行 ' + maxChars +
+            ' 字 / 最多 ' + maxLines + ' 行下无可行断点（不删字），请放宽规则或手动调整',
+        };
+      }
     }
     return { ok: true, lines: lines };
   }

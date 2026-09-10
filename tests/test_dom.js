@@ -76,6 +76,18 @@ function rows() { return [...window.document.querySelectorAll('#cueTbody tr')]; 
 function ta(i) { return rows()[i].querySelector('textarea'); }
 function timeVal(i, field) { return rows()[i].querySelector(`input[data-field="${field}"]`).value; }
 function click(el) { el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true })); }
+// 完整模拟真实点击按钮：mousedown（此时焦点仍在文本框）→ 文本框失焦、按钮聚焦 → mouseup → click
+function realClickButton(btn) {
+  const prevFocused = window.document.activeElement;
+  const taFocused = prevFocused && prevFocused.matches && prevFocused.matches('textarea') ? prevFocused : null;
+  btn.dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0 }));
+  if (taFocused) {
+    taFocused.dispatchEvent(new window.Event('blur', { bubbles: false }));
+    btn.focus();
+  }
+  btn.dispatchEvent(new window.MouseEvent('mouseup', { bubbles: true, cancelable: true, button: 0 }));
+  click(btn);
+}
 
 (async () => {
   // 等待示例自动载入
@@ -102,20 +114,43 @@ function click(el) { el.dispatchEvent(new window.MouseEvent('click', { bubbles: 
   ok(ta(3).value === before, '撤销分行');
   window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'y', ctrlKey: true, bubbles: true }));
 
-  console.log('3. 光标拆分（按比例）');
+  console.log('3. 真实按钮点击顺序：保留点击前光标（按比例）');
   const t1 = ta(0);
   t1.focus();
   t1.setSelectionRange(4, 4);
-  click(rows()[0].querySelector('.op-split'));
+  realClickButton(rows()[0].querySelector('.op-split'));
   ok(rows().length === 10, '拆分后 10 条');
-  ok(ta(0).value === '欢迎来到' && ta(1).value === '字幕节奏校准台', '文本拆分正确');
+  ok(ta(0).value === '欢迎来到' && ta(1).value === '字幕节奏校准台',
+    '保留点击前光标拆分（不是中点）：' + JSON.stringify([ta(0).value, ta(1).value]));
   ok(timeVal(0, 'end') === timeVal(1, 'start'), '分界连续：' + timeVal(0, 'end'));
-  ok(timeVal(0, 'end') === '00:00:01,336', '4:7 比例分界 1336ms：' + timeVal(0, 'end'));
+  ok(timeVal(0, 'end') === '00:00:01,336', '4:7 比例分界 1336ms（非中点 1545）：' + timeVal(0, 'end'));
   const nums = rows().slice(0, 3).map(r => r.querySelector('.c-num').textContent);
   ok(nums.join(',') === '1,2,3', '编号重排：' + nums.join(','));
-  // 撤销拆分
+
+  console.log('3b. 拆分后新文本框仍聚焦时 Ctrl+Z 撤销结构变更');
+  ok(window.document.activeElement === ta(1), '后段新文本框自动聚焦');
   window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
-  ok(rows().length === 9, '撤销拆分');
+  ok(rows().length === 9, '文本框聚焦下 Ctrl+Z 撤销拆分');
+  ok(ta(0).value === '欢迎来到字幕节奏校准台', '撤销后文本合并还原');
+
+  console.log('3c. 800ms 内连续两次拆分分别入栈，撤销一次只回退最后一次');
+  // 第 1 次：在第 4 字符后拆
+  ta(0).focus(); ta(0).setSelectionRange(4, 4);
+  realClickButton(rows()[0].querySelector('.op-split'));
+  ok(rows().length === 10, '连续拆分第 1 次');
+  // 第 2 次：对后段立即（<800ms）在第 2 字符后再拆（Ctrl+Enter 路径，焦点在新文本框）
+  ta(1).focus(); ta(1).setSelectionRange(2, 2);
+  ta(1).dispatchEvent(new window.KeyboardEvent('keydown',
+    { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));
+  ok(rows().length === 11, '连续拆分第 2 次（共 11 条）');
+  // 撤销一次：只回退第 2 次
+  window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  ok(rows().length === 10, '撤销一次仅回退最后一次拆分（回到 10 条）');
+  ok(ta(0).value === '欢迎来到', '第 1 次拆分仍保留');
+  // 再撤销：回退第 1 次
+  window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  ok(rows().length === 9, '第二次撤销回退第 1 次拆分（回到 9 条）');
+  ok(ta(0).value === '欢迎来到字幕节奏校准台', '完全还原');
 
   console.log('4. 光标开头拒绝');
   const t1fresh = ta(0);

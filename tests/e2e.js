@@ -550,6 +550,92 @@ function makeWav(seconds, freq) {
   await page.waitForTimeout(100);
   ok(await page.locator('#rewrapModal').isHidden(), '取消关闭预览');
 
+  // ---- 22b. 智能分行不得制造孤立标点 ----
+  console.log('22b. 孤立标点规避');
+  const orphanVtt = [
+    'WEBVTT', '',
+    '00:00:01.000 --> 00:00:03.000',
+    '一二三四，五',
+    '',
+    '00:00:03.500 --> 00:00:05.000',
+    '你好世界，再见',
+    '',
+  ].join('\n');
+  await page.locator('#fileInput').setInputFiles({ name: 'orphan.vtt', mimeType: 'text/vtt', buffer: Buffer.from(orphanVtt) });
+  await page.waitForTimeout(300);
+  // 每行 4 字、最多 2 行
+  await page.locator('#setMaxChars').fill('4');
+  await page.locator('#setMaxChars').dispatchEvent('change');
+  await page.locator('#setMaxLines').fill('2');
+  await page.locator('#setMaxLines').dispatchEvent('change');
+  await page.waitForTimeout(150);
+  await page.locator('#cueTbody tr').nth(0).locator('.op-rewrap').click();
+  await page.waitForTimeout(200);
+  const orphanOut = await page.locator('#cueTbody tr').nth(0).locator('textarea').inputValue();
+  ok(orphanOut === '一二三四，\n五', '标点跟随不孤立：' + JSON.stringify(orphanOut));
+  ok(!orphanOut.split('\n').some(l => /^[，。；：！？、,.]/.test(l)), '无行首孤立标点');
+  ok(orphanOut.replace(/\n/g, '') === '一二三四，五', '不删字');
+  // 悬挂标点（仅超宽 1 个标点）不应被标为超长行
+  const orphanSummary = await page.locator('#problemSummary').textContent();
+  ok(!/超长行/.test(orphanSummary), '悬挂标点不计超长行：' + orphanSummary.trim().slice(0, 60));
+  // 第二条同理：4 字限时「你好世界，」悬挂
+  await page.locator('#cueTbody tr').nth(1).locator('.op-rewrap').click();
+  await page.waitForTimeout(200);
+  const orphanOut2 = await page.locator('#cueTbody tr').nth(1).locator('textarea').inputValue();
+  ok(orphanOut2.startsWith('你好世界，'), '第二条例行标点跟随：' + JSON.stringify(orphanOut2));
+  // 恢复默认规则
+  await page.locator('#setMaxChars').fill('18');
+  await page.locator('#setMaxChars').dispatchEvent('change');
+  await page.locator('#setMaxLines').fill('2');
+  await page.locator('#setMaxLines').dispatchEvent('change');
+  await page.waitForTimeout(100);
+
+  // ---- 22c. 真实按钮点击顺序保留拆分前光标 ----
+  console.log('22c. 按钮拆分保留光标');
+  await page.locator('#btnSample').click();
+  await page.waitForTimeout(400);
+  if (await page.locator('#draftBanner').isVisible()) await page.locator('#btnDraftDismiss').click();
+  // 聚焦首条文本框并把光标放到第 4 字符后
+  await page.evaluate(() => {
+    const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
+    ta.focus(); ta.setSelectionRange(4, 4);
+  });
+  // 真实鼠标点击「拆」：mousedown 先于 blur
+  await page.locator('#cueTbody tr').nth(0).locator('.op-split').click();
+  await page.waitForTimeout(200);
+  ok(await page.locator('#cueTbody tr').count() === 10, '点击拆分条数 +1');
+  const caretTexts = await page.$$eval('#cueTbody tr', trs =>
+    trs.slice(0, 2).map(tr => tr.querySelector('textarea').value));
+  ok(caretTexts[0] === '欢迎来到' && caretTexts[1] === '字幕节奏校准台',
+    '按点击前光标拆分（非中点）：' + JSON.stringify(caretTexts));
+  const caretEnd = await page.locator('#cueTbody tr').nth(0).locator('input[data-field="end"]').inputValue();
+  ok(caretEnd === '00:00:01,336', '按字符比例 1336ms：' + caretEnd);
+  // 新文本框聚焦时 Ctrl+Z 撤销
+  ok(await page.evaluate(() => document.activeElement && document.activeElement.matches('textarea')), '后段文本框聚焦');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  ok(await page.locator('#cueTbody tr').count() === 9, '聚焦下 Ctrl+Z 撤销拆分');
+  // 连续两次拆分独立入栈：按钮一次 + 立即 Ctrl+Enter 一次
+  await page.evaluate(() => {
+    const ta = document.querySelectorAll('#cueTbody tr')[0].querySelector('textarea');
+    ta.focus(); ta.setSelectionRange(4, 4);
+  });
+  await page.locator('#cueTbody tr').nth(0).locator('.op-split').click();
+  await page.waitForTimeout(150);
+  await page.evaluate(() => {
+    const ta = document.querySelectorAll('#cueTbody tr')[1].querySelector('textarea');
+    ta.focus(); ta.setSelectionRange(2, 2);
+  });
+  await page.keyboard.press('Control+Enter');
+  await page.waitForTimeout(150);
+  ok(await page.locator('#cueTbody tr').count() === 11, '800ms 内连续两次拆分成功');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  ok(await page.locator('#cueTbody tr').count() === 10, '撤销一次只回退最后一次拆分');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  ok(await page.locator('#cueTbody tr').count() === 9, '再次撤销回退第一次拆分');
+
   // ---- 23. 无法满足限制时说明原因且不删字 ----
   console.log('23. 无法分行的原因');
   const vttLong = [

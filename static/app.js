@@ -120,12 +120,14 @@
 
   // ---------- 撤销 / 重做 ----------
   var lastUndoLabel = '', lastUndoTime = 0;
+  // 只有连续的拖拽与键盘微调合并为一步；拆分/合并/分行等结构操作每次独立入栈
+  var COALESCE_LABELS = { drag: true, nudge: true };
   function snapshot() { return JSON.stringify(state.doc.cues); }
   function pushUndo(label) {
     if (!state.doc) return;
     var now = Date.now();
-    // 同类操作 800ms 内合并为一步（拖拽、连续微调）
-    if (label && label === lastUndoLabel && now - lastUndoTime < 800) {
+    if (label && COALESCE_LABELS[label] &&
+      label === lastUndoLabel && now - lastUndoTime < 800) {
       lastUndoTime = now;
       return;
     }
@@ -366,23 +368,43 @@
     return best >= 0 ? best : mid;
   }
 
-  // 在第 i 条、其文本框光标 caret 处拆分；未聚焦该行文本框时按文本中点回退
+  // 记忆“点击操作按钮前”文本框中的光标：按钮 mousedown 先于文本框 blur，
+  // 在捕获阶段记下，点击处理函数即可沿用用户在文本中放置光标的位置。
+  var caretBeforeClick = null;   // {i, caret}
+  function rowIndexOfTa(el) {
+    var tr = el && el.closest ? el.closest('tr') : null;
+    return tr ? +tr.dataset.i : -1;
+  }
+  cueTbody.addEventListener('mousedown', function (e) {
+    // 在「拆」按钮上按下时（mousedown 先于文本框 blur），记下当前文本光标
+    var btn = e.target.closest && e.target.closest('button.op-split');
+    if (!btn) return;
+    var tr = e.target.closest('tr');
+    var ae = document.activeElement;
+    if (tr && ae && ae.matches && ae.matches('textarea') &&
+      ae.closest('tr') === tr) {
+      caretBeforeClick = { i: +tr.dataset.i, caret: ae.selectionStart };
+    }
+  }, true);
+
+  // 在第 i 条、其文本框光标 caret 处拆分；点击按钮导致文本框失焦时，
+  // 使用 mousedown 前记忆的光标；没有历史光标（如键盘选中后点按钮）才按中点回退
   function splitAtCaret(i, ta) {
     if (!state.doc) return;
-    // 输入后未失焦直接拆分：先把文本框当前内容提交到模型
     var rowTa = ta || (rowEls[i] && rowEls[i].querySelector('textarea'));
+    // 输入后未失焦直接拆分（Ctrl+Enter）：先把文本框当前内容提交到模型
     if (rowTa && document.activeElement === rowTa) commitRow(i);
     var cue = state.doc.cues[i];
     var full = cue.lines.join('\n');
     var caret = null;
-    var focusedOther = document.activeElement &&
-      document.activeElement.matches && document.activeElement.matches('textarea');
-    if (rowTa && document.activeElement === rowTa) caret = rowTa.selectionStart;
-    if (caret === null) {
-      if (focusedOther) { setStatus('请先点击要拆分字幕的文本框'); return; }
-      // 未聚焦文本框：优先在中点附近的断点（标点/空格）拆分，否则正中间
-      caret = pickMiddleCaret(full);
+    if (rowTa && document.activeElement === rowTa) {
+      caret = rowTa.selectionStart;
+    } else if (caretBeforeClick && caretBeforeClick.i === i &&
+      caretBeforeClick.caret >= 0 && caretBeforeClick.caret <= full.length) {
+      caret = caretBeforeClick.caret;
     }
+    if (caret === null) caret = pickMiddleCaret(full);
+    caretBeforeClick = null;
     var beforeLines = full.slice(0, caret).split(/\r?\n/);
     var afterLines = full.slice(caret).split(/\r?\n/);
     var inRange = state.playheadMs > cue.start && state.playheadMs < cue.end;
@@ -1297,6 +1319,18 @@
   document.addEventListener('keydown', function (e) {
     var tag = (e.target.tagName || '').toLowerCase();
     var typing = tag === 'input' || tag === 'textarea' || tag === 'select';
+    // 结构变更（拆分/合并/分行）后新文本框仍聚焦：textarea 中的 Ctrl+Z/Y
+    // 必须回退结构操作而非浏览器原生文本撤销；时间码输入框保留原生撤销。
+    var undoKey = (e.ctrlKey || e.metaKey) &&
+      (e.key.toLowerCase() === 'z' || e.key.toLowerCase() === 'y');
+    if (undoKey && (tag === 'textarea' || !typing)) {
+      e.preventDefault();
+      if (e.key.toLowerCase() === 'y' || e.shiftKey) doRedo(); else doUndo();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' && !typing) {
+      e.preventDefault(); searchInput.focus(); searchInput.select(); return;
+    }
     if (e.key === 'Escape' && typing) { e.target.blur(); return; }
     if (typing) return;
     if (!diffModal.classList.contains('hidden')) {
@@ -1312,17 +1346,6 @@
       return;
     }
     var step = e.shiftKey ? 500 : (e.altKey ? 10 : 100);
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-      e.preventDefault();
-      if (e.shiftKey) doRedo(); else doUndo();
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
-      e.preventDefault(); doRedo(); return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
-      e.preventDefault(); searchInput.focus(); searchInput.select(); return;
-    }
     switch (e.key) {
       case ' ':
         e.preventDefault();

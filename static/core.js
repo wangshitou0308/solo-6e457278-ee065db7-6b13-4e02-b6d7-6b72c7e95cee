@@ -661,6 +661,490 @@
     });
   }
 
+  // ---------- 版本对照：规范化文本 / 相似度 ----------
+
+  var ALIGN_DEFAULTS = {
+    TIME_W: 0.6,          // 时间得分权重
+    TEXT_W: 0.4,          // 文本得分权重
+    MATCH_MIN: 0.5,       // 低于该分不配为一对（按仅当前/仅对照处理）
+    CONF_MIN: 0.74,       // 高置信度门槛
+    TIE_MARGIN: 0.12,     // 与备选配对分差 ≤ 此值 → 配对不唯一，标冲突
+    GROUP_TIE: 0.08,      // 组内单配与整体得分过近 → 一对多/多对一不明确
+    GAP: 0.22,            // 每跳过一侧一条的扣分
+    MAX_GROUP: 3,         // 一对多 / 多对一单侧最多条数
+    NEAR_MS: 60000,       // 粗筛：时间相距过远的候选直接跳过
+  };
+
+  // 规范化文本：去 HTML 标签、全角转半角、小写，只保留字母数字与中日韩文字/假名，
+  // 忽略标点、空白与换行差异，用于相似度计算。
+  function normalizeText(s) {
+    var t = stripTags(String(s))
+      .replace(/[！-～]/g, function (ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); })
+      .replace(/　/g, ' ')
+      .toLowerCase();
+    var out = '';
+    for (var k = 0; k < t.length; k++) {
+      var ch = t[k];
+      if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+          ('一' <= ch && ch <= '鿿') || ('㐀' <= ch && ch <= '䶿') ||
+          ('぀' <= ch && ch <= 'ヿ')) {
+        out += ch;
+      }
+    }
+    return out;
+  }
+
+  function codePoints(s) { return Array.from(String(s)); }
+
+  function levenshtein(a, b) {
+    var n = a.length, m = b.length;
+    if (!n) return m;
+    if (!m) return n;
+    if (n * m > 160000) {
+      // 超长文本的防御性上界：退化为“较短长度 / 较长长度”，避免平方级开销
+      return Math.max(n, m) - Math.min(n, m);
+    }
+    var prev = [], cur = [], k;
+    for (k = 0; k <= m; k++) prev[k] = k;
+    for (var i = 1; i <= n; i++) {
+      cur[0] = i;
+      var ca = a[i - 1];
+      for (var j = 1; j <= m; j++) {
+        var cost = ca === b[j - 1] ? 0 : 1;
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      }
+      var tmp = prev; prev = cur; cur = tmp;
+    }
+    return prev[m];
+  }
+
+  // 规范化文本相似度 0..1（编辑距离比例）
+  function textSimilarity(a, b) {
+    if (!a && !b) return 1;
+    var d = levenshtein(a, b);
+    return 1 - d / Math.max(a.length, b.length);
+  }
+
+  function groupNormText(cues, start, len) {
+    var parts = [];
+    for (var k = 0; k < len; k++) parts.push(cues[start + k].lines.join(' '));
+    return normalizeText(parts.join(' '));
+  }
+  // 组内原始文本（保留换行与标签，供差异渲染）
+  function groupRawText(cues, start, len) {
+    var parts = [];
+    for (var k = 0; k < len; k++) parts.push(cues[start + k].lines.join('\n'));
+    return parts.join('\n');
+  }
+  function groupSpan(cues, start, len) {
+    var s = cues[start].start, e = cues[start].end;
+    for (var k = 1; k < len; k++) {
+      s = Math.min(s, cues[start + k].start);
+      e = Math.max(e, cues[start + k].end);
+    }
+    return { start: s, end: e };
+  }
+
+  // 两个时间区间的接近度 0..1：有重叠取 IoU，无重叠按中点距离衰减（取两者较大值）
+  function intervalTimeScore(s1, e1, s2, e2) {
+    var overlap = Math.min(e1, e2) - Math.max(s1, s2);
+    var iou = 0;
+    if (overlap > 0) {
+      var union = Math.max(e1, e2) - Math.min(s1, s2);
+      iou = union > 0 ? overlap / union : 1;
+    }
+    var dur = Math.max(1, ((e1 - s1) + (e2 - s2)) / 2);
+    var center = dur / (dur + Math.abs((s1 + e1) / 2 - (s2 + e2) / 2));
+    return Math.max(iou, center);
+  }
+
+  // ---------- 序列对齐：一对一 / 一对多 / 多对一 + 两侧缺口 ----------
+
+  // 对齐当前版 cuesA 与对照版 cuesB，返回 { entries, stats }。
+  // entry:
+  //   {kind:'pair', ai, alen, bj, blen, score, conflict, reasons[],
+  //    textChanged, timeChanged, dStart, dEnd, ...}
+  //   {kind:'only-a', ai}（仅当前版）  {kind:'only-b', bj, aBefore}（仅对照版）
+  // 低置信度或配对方式不唯一的 pair 标 conflict，不替用户选边。
+  function alignDocuments(cuesA, cuesB, opts) {
+    var cfg = {};
+    Object.keys(ALIGN_DEFAULTS).forEach(function (k) {
+      cfg[k] = (opts && opts[k] !== undefined) ? opts[k] : ALIGN_DEFAULTS[k];
+    });
+    var n = cuesA.length, m = cuesB.length;
+    var memo = {};
+    function blockScore(i, la, j, lb) {
+      var key = i + ',' + la + ',' + j + ',' + lb;
+      if (memo[key] !== undefined) return memo[key];
+      var ga = groupSpan(cuesA, i, la), gb = groupSpan(cuesB, j, lb);
+      var dur = Math.max(ga.end - ga.start, gb.end - gb.start, 1);
+      var dc = Math.abs((ga.start + ga.end) / 2 - (gb.start + gb.end) / 2);
+      // 粗筛：中点距离过远（超过 60s 且超过 5 倍自身时长）→ 必然低于 MATCH_MIN
+      if (dc > cfg.NEAR_MS && dc > 5 * dur) return (memo[key] = null);
+      var ts = intervalTimeScore(ga.start, ga.end, gb.start, gb.end);
+      var sim = textSimilarity(groupNormText(cuesA, i, la), groupNormText(cuesB, j, lb));
+      var score = cfg.TIME_W * ts + cfg.TEXT_W * sim;
+      // 多成员组（一对多 / 多对一）天然弱于一对一：每多吞并一条扣 0.15，
+      // 避免偶然的区间覆盖把无关条目卷进同组。
+      score -= 0.15 * ((la - 1) + (lb - 1));
+      return (memo[key] = score >= cfg.MATCH_MIN ? score : null);
+    }
+
+    // DP：dp[i][j] 为对齐 A 前 i 条、B 前 j 条的最高得分
+    var dp = [], back = [];
+    for (var i = 0; i <= n; i++) {
+      dp.push(new Array(m + 1).fill(0));
+      back.push(new Array(m + 1).fill(null));
+    }
+    for (i = 1; i <= n; i++) { dp[i][0] = -i * cfg.GAP; back[i][0] = { d: 'a' }; }
+    for (var j = 1; j <= m; j++) { dp[0][j] = -j * cfg.GAP; back[0][j] = { d: 'b' }; }
+    for (i = 1; i <= n; i++) {
+      for (j = 1; j <= m; j++) {
+        var best = dp[i - 1][j] - cfg.GAP, bd = { d: 'a' };
+        var v = dp[i][j - 1] - cfg.GAP;
+        if (v > best) { best = v; bd = { d: 'b' }; }
+        for (var la = 1; la <= cfg.MAX_GROUP && la <= i; la++) {
+          for (var lb = 1; lb <= cfg.MAX_GROUP && lb <= j; lb++) {
+            if (la !== 1 && lb !== 1) continue;   // 不支持多对多
+            var s = blockScore(i - la, la, j - lb, lb);
+            if (s === null) continue;
+            v = dp[i - la][j - lb] + s;
+            if (v > best) { best = v; bd = { d: 'm', la: la, lb: lb, score: s }; }
+          }
+        }
+        dp[i][j] = best; back[i][j] = bd;
+      }
+    }
+
+    // 回溯
+    var blocks = [];
+    var ii = n, jj = m;
+    while (ii > 0 || jj > 0) {
+      var b = back[ii][jj];
+      if (b.d === 'a') { blocks.push({ kind: 'only-a', ai: ii - 1 }); ii--; }
+      else if (b.d === 'b') { blocks.push({ kind: 'only-b', bj: jj - 1, aBefore: ii }); jj--; }
+      else {
+        blocks.push({ kind: 'pair', ai: ii - b.la, alen: b.la, bj: jj - b.lb, blen: b.lb, score: b.score });
+        ii -= b.la; jj -= b.lb;
+      }
+    }
+    blocks.reverse();
+
+    // 备选配对扫描（窗口 ±2，含不同组大小）：找与该块争夺同一侧条目的最强候选
+    function bestAlt(e) {
+      var bestAltScore = -1;
+      var i0 = Math.max(0, e.ai - 2), i1 = Math.min(n - 1, e.ai + e.alen + 1);
+      var j0 = Math.max(0, e.bj - 2), j1 = Math.min(m - 1, e.bj + e.blen + 1);
+      for (var x = i0; x <= i1; x++) {
+        for (var la = 1; la <= cfg.MAX_GROUP && x + la <= n; la++) {
+          for (var y = j0; y <= j1; y++) {
+            for (var lb = 1; lb <= cfg.MAX_GROUP && y + lb <= m; lb++) {
+              if (la !== 1 && lb !== 1) continue;
+              var sameA = x === e.ai && la === e.alen;
+              var sameB = y === e.bj && lb === e.blen;
+              var touchesA = x < e.ai + e.alen && x + la > e.ai;
+              var touchesB = y < e.bj + e.blen && y + lb > e.bj;
+              if (sameA && sameB) continue;
+              if (!(touchesA || touchesB)) continue;
+              var s = blockScore(x, la, y, lb);
+              if (s !== null && s > bestAltScore) bestAltScore = s;
+            }
+          }
+        }
+      }
+      return bestAltScore;
+    }
+
+    var entries = [];
+    var stats = { pairs: 0, onlyA: 0, onlyB: 0, conflicts: 0, changed: 0 };
+    blocks.forEach(function (e) {
+      if (e.kind === 'only-a') { stats.onlyA++; entries.push(e); return; }
+      if (e.kind === 'only-b') { stats.onlyB++; entries.push(e); return; }
+      stats.pairs++;
+      var ga = groupSpan(cuesA, e.ai, e.alen), gb = groupSpan(cuesB, e.bj, e.blen);
+      var rawA = groupRawText(cuesA, e.ai, e.alen);
+      var rawB = groupRawText(cuesB, e.bj, e.blen);
+      var sim = textSimilarity(normalizeText(rawA), normalizeText(rawB));
+      e.aRaw = rawA; e.bRaw = rawB;
+      e.textChanged = sim < 0.985;
+      e.dStart = gb.start - ga.start;
+      e.dEnd = gb.end - ga.end;
+      e.timeChanged = e.alen === 1 && e.blen === 1
+        ? (Math.abs(e.dStart) > 1 || Math.abs(e.dEnd) > 1)
+        : (ga.start !== gb.start || ga.end !== gb.end);
+      e.conflict = false;
+      e.reasons = [];
+      if (e.score < cfg.CONF_MIN) {
+        e.conflict = true;
+        e.reasons.push('置信度偏低（' + Math.round(e.score * 100) + '%）');
+      }
+      var alt = bestAlt(e);
+      if (alt >= 0 && e.score - alt <= cfg.TIE_MARGIN) {
+        e.conflict = true;
+        e.reasons.push('存在得分接近的其它配对（' + Math.round(alt * 100) + '%），配对方式不唯一');
+      }
+      // 一对多 / 多对一的内聚性：组内任一单配几乎和整体同样好 → 分组依据不足
+      if (e.alen > 1 || e.blen > 1) {
+        var bestSingle = -1;
+        for (var x = e.ai; x < e.ai + e.alen; x++) {
+          for (var y = e.bj; y < e.bj + e.blen; y++) {
+            var s = blockScore(x, 1, y, 1);
+            if (s !== null && s > bestSingle) bestSingle = s;
+          }
+        }
+        if (bestSingle >= 0 && e.score - bestSingle <= cfg.GROUP_TIE) {
+          e.conflict = true;
+          e.reasons.push('组内单条配对与整组得分接近，拆分 / 合并方式不明确');
+        }
+      }
+      if (e.conflict) stats.conflicts++;
+      if (e.textChanged || e.timeChanged) stats.changed++;
+      entries.push(e);
+    });
+    return { entries: entries, stats: stats, config: cfg };
+  }
+
+  // ---------- 字符级差异（LCS），供并排文本渲染 ----------
+  // 返回 [{t:'eq'|'del'|'ins', s}]；del 只出现在旧侧，ins 只出现在新侧。
+  function diffSegments(a, b) {
+    var A = codePoints(a), B = codePoints(b);
+    var n = A.length, m = B.length;
+    var lcs = [];
+    for (var i = 0; i <= n; i++) lcs.push(new Array(m + 1).fill(0));
+    for (i = n - 1; i >= 0; i--) {
+      for (var j = m - 1; j >= 0; j--) {
+        lcs[i][j] = A[i] === B[j] ? lcs[i + 1][j + 1] + 1
+          : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      }
+    }
+    var segs = [], i = 0, j = 0;
+    function push(t, s) {
+      var last = segs[segs.length - 1];
+      if (last && last.t === t) last.s += s;
+      else segs.push({ t: t, s: s });
+    }
+    while (i < n && j < m) {
+      if (A[i] === B[j]) { push('eq', A[i]); i++; j++; }
+      else if (lcs[i + 1][j] >= lcs[i][j + 1]) { push('del', A[i]); i++; }
+      else { push('ins', B[j]); j++; }
+    }
+    while (i < n) { push('del', A[i]); i++; }
+    while (j < m) { push('ins', B[j]); j++; }
+    return segs;
+  }
+
+  // ---------- 合并操作（纯函数：不修改输入，返回 {cues} 或 {error}） ----------
+
+  // 采用对照文本（时间与标识不变）
+  function adoptText(cues, at, lines) {
+    if (!Array.isArray(cues) || at < 0 || at >= cues.length) return { error: '指定的字幕不存在' };
+    var ls = (lines || []).slice();
+    while (ls.length > 1 && ls[ls.length - 1] === '') ls.pop();
+    if (effectiveLength(ls.join('\n')) === 0) return { error: '对照文本为空，不能采用' };
+    var out = cues.map(cloneCue);
+    out[at].lines = ls;
+    return { cues: out };
+  }
+
+  // 单条改时的“不把时序变得更糟”校验：不倒序、不与原本分离的邻居新产生重叠
+  function timeOrderError(cues, at, start, end) {
+    if (start < 0) return '开始时间不能为负（' + fmtMs(start, 'srt') + '）';
+    if (!(end > start)) return '结束时间必须晚于开始时间（' + fmtMs(start, 'srt') + ' → ' + fmtMs(end, 'srt') + '）';
+    if (at > 0) {
+      var prevBound = Math.min(cues[at - 1].end, cues[at].start);
+      if (start < prevBound) {
+        return '会与上一条产生新的重叠 / 倒序（起点早于 ' + fmtMs(prevBound, 'srt') + '）';
+      }
+    }
+    if (at + 1 < cues.length) {
+      var nextBound = Math.max(cues[at + 1].start, cues[at].end);
+      if (end > nextBound) {
+        return '会与下一条产生新的重叠 / 倒序（终点晚于 ' + fmtMs(nextBound, 'srt') + '）';
+      }
+    }
+    return null;
+  }
+
+  function adoptTime(cues, at, start, end) {
+    if (!Array.isArray(cues) || at < 0 || at >= cues.length) return { error: '指定的字幕不存在' };
+    var err = timeOrderError(cues, at, start, end);
+    if (err) return { error: err };
+    var out = cues.map(cloneCue);
+    out[at].start = start; out[at].end = end;
+    return { cues: out };
+  }
+
+  // 标识合并：当前版显式 cue 标识优先（属于当前轨道），否则沿用对照版标识；
+  // settings 保留当前版非空设置，否则采用对照版，绝不把已有设置清空。
+  function mergeIdentity(curCue, refCue) {
+    if (curCue && !curCue.autoNum) return { num: curCue.num, autoNum: false };
+    if (refCue && !refCue.autoNum) return { num: refCue.num, autoNum: false };
+    return { num: curCue ? curCue.num : (refCue ? refCue.num : ''), autoNum: true };
+  }
+  function mergeSettings(curCue, refCue) {
+    if (curCue && curCue.settings) return curCue.settings;
+    if (refCue && refCue.settings) return refCue.settings;
+    return '';
+  }
+
+  // 整条采用（一对一）：文本 + 时间来自对照版；标识 / 设置按 mergeIdentity 保留
+  function adoptFull(cues, at, refCue, format) {
+    if (!Array.isArray(cues) || at < 0 || at >= cues.length) return { error: '指定的字幕不存在' };
+    if (effectiveLength((refCue.lines || []).join('\n')) === 0) return { error: '对照文本为空，不能采用' };
+    var err = timeOrderError(cues, at, refCue.start, refCue.end);
+    if (err) return { error: err };
+    var out = cues.map(cloneCue);
+    var dst = cloneCue(refCue);
+    var id = mergeIdentity(out[at], refCue);
+    dst.num = id.num; dst.autoNum = id.autoNum;
+    dst.settings = mergeSettings(out[at], refCue);
+    out[at] = dst;
+    renumber(out, format);
+    return { cues: out };
+  }
+
+  // 成组替换：把当前版 [at, at+alen) 替换为对照版 refCues[bStart, bStart+bLen)。
+  // 覆盖一对一之外的整组采用（一对多拆分 / 多对一合并）。
+  function replaceGroup(cues, at, alen, refCues, bStart, blen, format) {
+    if (at < 0 || at + alen > cues.length || alen < 1) return { error: '当前版区间无效' };
+    if (bStart < 0 || bStart + blen > refCues.length || blen < 1) return { error: '对照版区间无效' };
+    if (alen === 1 && blen === 1) return adoptFull(cues, at, refCues[bStart], format);
+    var seg = [];
+    for (var k = 0; k < blen; k++) {
+      var r = refCues[bStart + k];
+      if (!(r.end > r.start)) {
+        return { error: '对照版第 ' + r.num + ' 条时长无效，已取消整组采用' };
+      }
+      if (k > 0 && r.start < refCues[bStart + k - 1].end) {
+        return { error: '对照版该组内部存在重叠 / 倒序，已取消整组采用' };
+      }
+      var c = cloneCue(r);
+      if (k === 0) {
+        var id = mergeIdentity(cues[at], r);
+        c.num = id.num; c.autoNum = id.autoNum;
+        c.settings = mergeSettings(cues[at], r);
+      }
+      // k>0 完整保留对照条目的显式标识与设置；无标识则为自动编号
+      seg.push(c);
+    }
+    // 与组外邻居的时序校验（不新造重叠 / 倒序）
+    var first = seg[0], last = seg[seg.length - 1];
+    if (at > 0) {
+      var prevBound = Math.min(cues[at - 1].end, cues[at].start);
+      if (first.start < prevBound) {
+        return { error: '整组采用后会与上一条产生新的重叠 / 倒序（起点早于 ' + fmtMs(prevBound, 'srt') + '）' };
+      }
+    }
+    if (at + alen < cues.length) {
+      var nextBound = Math.max(cues[at + alen].start, cues[at + alen - 1].end);
+      if (last.end > nextBound) {
+        return { error: '整组采用后会与下一条产生新的重叠 / 倒序（终点晚于 ' + fmtMs(nextBound, 'srt') + '）' };
+      }
+    }
+    var out = cues.slice(0, at).concat(seg, cues.slice(at + alen));
+    renumber(out, format);
+    return { cues: out };
+  }
+
+  // 插入“仅对照版”条目：复制对照 cue 到 at（0..n）位置，须落在相邻条目的间隙中
+  function insertOnlyB(cues, at, refCue, format) {
+    if (at < 0 || at > cues.length) return { error: '插入位置无效' };
+    if (!(refCue.end > refCue.start)) return { error: '对照条目的时长无效' };
+    if (at > 0 && refCue.start < cues[at - 1].end) {
+      return { error: '对照条与上一条重叠（早于 ' + fmtMs(cues[at - 1].end, 'srt') + '），请先手动调整后再插入' };
+    }
+    if (at < cues.length && refCue.end > cues[at].start) {
+      return { error: '对照条与下一条重叠（晚于 ' + fmtMs(cues[at].start, 'srt') + '），请先手动调整后再插入' };
+    }
+    var c = cloneCue(refCue);
+    c.autoNum = format === 'vtt' ? !!refCue.autoNum : true;
+    if (format !== 'vtt' || refCue.autoNum) c.num = '';
+    var out = cues.slice(0, at).concat([c], cues.slice(at));
+    renumber(out, format);
+    return { cues: out };
+  }
+
+  // 删除“仅当前版”条目
+  function deleteOnlyA(cues, at, format) {
+    if (at < 0 || at >= cues.length) return { error: '指定的字幕不存在' };
+    var out = cues.slice(0, at).concat(cues.slice(at + 1));
+    renumber(out, format);
+    return { cues: out };
+  }
+
+  // 预计算某条对照条目上每个手动操作是否可用（返回错误说明，null 表示可用）
+  function entryActionErrors(cur, ref, e) {
+    var res = {};
+    if (e.kind === 'pair') {
+      var refLines = [];
+      for (var k = 0; k < e.blen; k++) refLines = refLines.concat(ref[e.bj + k].lines.slice());
+      res.text = (e.alen === 1 && e.blen === 1 && effectiveLength(refLines.join('\n')) > 0)
+        ? null : '多对多结构请使用整组采用';
+      if (e.alen === 1 && e.blen === 1) {
+        var r = ref[e.bj];
+        res.time = timeOrderError(cur, e.ai, r.start, r.end);
+        res.full = res.time || (effectiveLength(r.lines.join('\n')) === 0 ? '对照文本为空' : null);
+      } else {
+        res.time = '结构不同（' + e.alen + ' ↔ ' + e.blen + '），请使用整组采用';
+        res.full = res.time;
+      }
+      res.group = null;
+      var rg = replaceGroup(cur, e.ai, e.alen, ref, e.bj, e.blen, 'srt');
+      if (rg.error) res.group = rg.error;
+    } else if (e.kind === 'only-b') {
+      var ins = insertOnlyB(cur, e.aBefore, ref[e.bj], 'srt');
+      res.insert = ins.error || null;
+    } else {
+      res.del = null;
+    }
+    return res;
+  }
+
+  // ---------- 批量合并计划（模拟应用，不修改输入） ----------
+  // actions: { [entryIdx]: 'text'|'time'|'full'|'group'|'insert'|'delete' }
+  // 按时间轴顺序逐条模拟；当前条件下不可应用的条目进 blocked 并跳过，不影响其余条目。
+  // 返回 { cues, applied:[{idx,mode}], blocked:[{idx,mode,reason}] }。
+  function planMerge(cues, refCues, entries, actions, format) {
+    var w = cues.map(cloneCue);
+    var delta = 0;
+    var applied = [], blocked = [];
+    function fail(idx, mode, reason) { blocked.push({ idx: idx, mode: mode, reason: reason }); }
+    entries.forEach(function (e, idx) {
+      var mode = actions[idx];
+      if (!mode) return;
+      var res;
+      if (e.kind === 'pair') {
+        var at = e.ai + delta;
+        if (mode === 'text') {
+          if (e.alen !== 1 || e.blen !== 1) { fail(idx, mode, '仅一对一可采用文本'); return; }
+          res = adoptText(w, at, refCues[e.bj].lines);
+        } else if (mode === 'time') {
+          if (e.alen !== 1 || e.blen !== 1) { fail(idx, mode, '仅一对一可采用时间'); return; }
+          res = adoptTime(w, at, refCues[e.bj].start, refCues[e.bj].end);
+        } else if (mode === 'full') {
+          if (e.alen !== 1 || e.blen !== 1) { fail(idx, mode, '结构不同请使用整组采用'); return; }
+          res = adoptFull(w, at, refCues[e.bj], format);
+        } else if (mode === 'group') {
+          res = replaceGroup(w, at, e.alen, refCues, e.bj, e.blen, format);
+          if (!res.error) delta += e.blen - e.alen;
+        } else { fail(idx, mode, '未知操作'); return; }
+        if (res.error) fail(idx, mode, res.error);
+        else { w = res.cues; applied.push({ idx: idx, mode: mode }); }
+      } else if (e.kind === 'only-b' && mode === 'insert') {
+        res = insertOnlyB(w, e.aBefore + delta, refCues[e.bj], format);
+        if (res.error) fail(idx, mode, res.error);
+        else { w = res.cues; delta += 1; applied.push({ idx: idx, mode: mode }); }
+      } else if (e.kind === 'only-a' && mode === 'delete') {
+        res = deleteOnlyA(w, e.ai + delta, format);
+        if (res.error) fail(idx, mode, res.error);
+        else { w = res.cues; delta -= 1; applied.push({ idx: idx, mode: mode }); }
+      } else {
+        fail(idx, mode, '操作与条目类型不匹配');
+      }
+    });
+    return { cues: w, applied: applied, blocked: blocked };
+  }
+
   // ---------- 草稿键 ----------
 
   // FNV-1a 简易哈希，用于生成草稿键
@@ -686,6 +1170,13 @@
     effectiveLength: effectiveLength, displayWidth: displayWidth,
     analyzeLayout: analyzeLayout, analyzeCueLayout: analyzeCueLayout,
     rewrapCue: rewrapCue, planRewrap: planRewrap,
+    // 版本对照与合并
+    normalizeText: normalizeText, textSimilarity: textSimilarity,
+    intervalTimeScore: intervalTimeScore, diffSegments: diffSegments,
+    alignDocuments: alignDocuments,
+    adoptText: adoptText, adoptTime: adoptTime, adoptFull: adoptFull,
+    replaceGroup: replaceGroup, insertOnlyB: insertOnlyB, deleteOnlyA: deleteOnlyA,
+    entryActionErrors: entryActionErrors, planMerge: planMerge,
     simpleHash: simpleHash, draftKey: draftKey,
   };
 });

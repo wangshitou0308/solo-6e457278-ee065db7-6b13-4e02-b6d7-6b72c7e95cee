@@ -1,0 +1,63 @@
+# 字幕节奏校准台
+
+本地运行的字幕时间轴校准工具。后端仅使用 Python 标准库（`http.server` + `sqlite3`），
+前端为原生 HTML/CSS/JavaScript，**无需账号、密钥或任何外部服务**。
+
+## 启动
+
+```bash
+python3 server.py        # 默认端口 8000
+python3 server.py 9000   # 指定端口
+```
+
+然后浏览器打开 <http://127.0.0.1:8000/>。首次启动自动载入内置示例字幕。
+
+## 功能
+
+- **导入 / 解析**：支持 SRT 与 WebVTT（含 VTT 头部与 cue 设置的保留），自动识别格式。
+- **可缩放时间轴**：滚轮缩放（以光标为锚点）、空白处拖动平移、`适配` 按钮或按 `0` 复位；
+  红色模拟播放头可播放/暂停（空格），拖动标尺直接定位。
+- **拖动校时**：拖动字幕块整体平移，拖动左右边缘调整起止，列表中的时间实时联动。
+- **节奏规则检查**：可配置语速上限（字/秒）、最短停留、相邻最小间隔、是否允许重叠；
+  问题按类型汇总在右侧面板，点击即可定位到对应字幕。
+- **自动顺延**：一键生成保持原有顺序的修复方案（延长过短停留、按间隔向后顺延），
+  应用前弹出**修改前后差异预览**。
+- **撤销 / 重做**：`Ctrl+Z` / `Ctrl+Y`（或 `Ctrl+Shift+Z`），拖拽与连续微调自动合并为一步。
+- **键盘微调**：`←`/`→` 整体平移；`[` `]` 调起点；`;` `'` 调终点；
+  步进 100ms，`Shift` 500ms，`Alt` 10ms；`↑`/`↓` 切换选中行。
+- **文本搜索**：`Ctrl+F`，命中行高亮，回车跳转下一个（`Shift+Enter` 上一个）。
+- **本地草稿**：每次修改自动保存到后端 sqlite3（`drafts.db`，按文件内容哈希区分）；
+  重新导入同一文件时提示恢复，导出后自动清除。
+- **导出**：保持原编号与文本换行，可导出为原格式 / SRT / VTT。
+
+## 目录结构
+
+```
+server.py          # 后端：静态文件 + /api/sample + /api/draft（sqlite3）
+static/index.html  # 页面结构
+static/style.css   # 深色主题样式
+static/core.js     # 纯逻辑：解析/序列化/分析/自动顺延（浏览器与 Node 通用）
+static/app.js      # 界面交互：时间轴、拖拽、撤销重做、搜索、草稿、导出
+tests/test_core.js # 核心逻辑单元测试（Node）
+tests/e2e.js       # 浏览器端到端测试（可选，需 playwright-core + Chromium）
+```
+
+## 测试
+
+```bash
+node tests/test_core.js   # 核心逻辑单元测试（36 项）
+python3 -m py_compile server.py
+```
+
+端到端测试（可选）：`npm install playwright-core && npx playwright-core install chromium`
+后，启动服务器于 8123 端口，执行 `node tests/e2e.js`（35 项交互断言）。
+
+## API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/sample` | 内置示例字幕 |
+| GET | `/api/draft?key=` | 查询草稿 |
+| POST | `/api/draft` | 保存草稿 `{key, filename, format, content}` |
+| DELETE | `/api/draft?key=` | 删除草稿 |
+| GET | `/api/health` | 健康检查 |

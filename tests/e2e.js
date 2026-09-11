@@ -726,6 +726,162 @@ function makeWav(seconds, freq) {
     '前后两段均保留 cue 设置');
   ok(!/^2$/m.test(splitVttOut.split('intro-cue')[1] || ''), '后段不写入自动编号');
 
+  // ---- 25. 版本对照合并 ----
+  console.log('25. 版本对照合并');
+  const curSrt = [
+    '1', '00:00:01,000 --> 00:00:02,000', '你好世界', '',
+    '2', '00:00:03,000 --> 00:00:04,000', '旧文本内容', '',
+    '3', '00:00:05,000 --> 00:00:06,000', '只在当前版', '',
+    '4', '00:00:07,000 --> 00:00:10,000', '一句很长的话被拆成了两半内容', '',
+    '5', '00:00:11,000 --> 00:00:14,000', '多对一的两句话后半句内容', '',
+  ].join('\n');
+  const refVtt = [
+    'WEBVTT', '',
+    'cue-1', '00:00:01.500 --> 00:00:02.500', '你好世界', '',
+    'cue-2', '00:00:03.000 --> 00:00:04.000', '新文本内容', '',
+    'cue-4a', '00:00:07.000 --> 00:00:08.500 align:start position:20%', '一句很长的话', '',
+    'cue-4b', '00:00:08.500 --> 00:00:10.000', '被拆成了两半内容', '',
+    'cue-5', '00:00:11.000 --> 00:00:14.000', '多对一的两句话后半句内容', '',
+    'cue-8', '00:00:15.000 --> 00:00:16.000', '只在对照版', '',
+  ].join('\n');
+  await page.locator('#fileInput').setInputFiles({ name: 'cur.srt', mimeType: 'text/plain', buffer: Buffer.from(curSrt) });
+  await page.waitForTimeout(300);
+  // 入口：未载入对照时隐藏
+  ok(await page.locator('#btnCompareView').isHidden(), '未载入对照时入口隐藏');
+  const reqBodies = [];
+  page.on('request', req => {
+    if (req.url().includes('/api/draft') && req.method() === 'POST') {
+      try { reqBodies.push(req.postData() || ''); } catch (e) {}
+    }
+  });
+  await page.locator('#compareInput').setInputFiles({ name: 'ref.vtt', mimeType: 'text/vtt', buffer: Buffer.from(refVtt) });
+  await page.waitForTimeout(300);
+  ok(await page.locator('#compareView').isVisible(), '载入对照后自动进入对照视图');
+  ok(await page.locator('#btnCompareView').isVisible(), '顶栏出现对照合并切换按钮');
+  const cmpInfo = await page.locator('#compareFileInfo').textContent();
+  ok(cmpInfo.includes('ref.vtt') && cmpInfo.includes('VTT'), '对照文件信息：' + cmpInfo);
+  // 对齐：全部条目
+  await page.locator('#cmpFilter').selectOption('all');
+  const cmpCount = await page.locator('#cmpTbody tr').count();
+  ok(cmpCount === 6, `对齐 6 个条目（实际 ${cmpCount}）`);
+  const kinds = await page.$$eval('#cmpTbody tr .cmp-kind-badge', els => els.map(e => e.textContent));
+  ok(kinds.some(k => k.includes('文字变化')), '识别文字变化');
+  ok(kinds.some(k => k.includes('时间偏移')), '识别时间偏移');
+  ok(kinds.some(k => k.includes('1↔2')), '识别一对多');
+  ok(kinds.some(k => k.includes('仅当前')), '识别仅当前版');
+  ok(kinds.some(k => k.includes('仅对照')), '识别仅对照版');
+  // 字符差异高亮
+  const hasDiffMarks = await page.$$eval('#cmpTbody tr', trs =>
+    trs.some(tr => tr.querySelectorAll('.cmp-cell .del').length > 0 &&
+                   tr.querySelectorAll('.cmp-cell .ins').length > 0));
+  ok(hasDiffMarks, '并排文本显示字符级增删');
+  // 双层时间轴已绘制（canvas 尺寸正常、无错误）
+  const tlSize = await page.evaluate(() => {
+    const c = document.getElementById('compareTimeline');
+    return { w: c.width, h: c.height };
+  });
+  ok(tlSize.w > 0 && tlSize.h > 0, '双层时间轴已渲染');
+
+  // 点击条目同步定位播放头
+  const textRow = page.locator('#cmpTbody tr').filter({ hasText: '新文本内容' }).first();
+  await textRow.click();
+  await page.waitForTimeout(100);
+  ok((await page.locator('#playTime').textContent()).startsWith('00:03'), '点击条目定位播放头');
+
+  // 逐项采用文本
+  const tBefore = await page.locator('#cueTbody tr').nth(1).locator('textarea').inputValue();
+  await textRow.locator('button[data-mode="text"]').click();
+  await page.waitForTimeout(150);
+  ok((await page.locator('#cueTbody tr').nth(1).locator('textarea').inputValue()) === '新文本内容', '逐项采用文本生效');
+  // 撤销
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  ok((await page.locator('#cueTbody tr').nth(1).locator('textarea').inputValue()) === tBefore, '撤销采用文本');
+  await page.keyboard.press('Control+y');
+  await page.waitForTimeout(150);
+
+  // 批量合并预览
+  await page.locator('#btnBatchMerge').click();
+  await page.waitForTimeout(200);
+  ok(await page.locator('#mergeModal').isVisible(), '批量合并预览出现');
+  const mergeSummary = await page.locator('#mergeSummary').textContent();
+  ok(/将应用 \d+ 项/.test(mergeSummary), '显示应用项数：' + mergeSummary.trim().slice(0, 50));
+  // 应用
+  await page.locator('#btnMergeApply').click();
+  await page.waitForTimeout(300);
+  ok(await page.locator('#mergeModal').isHidden(), '应用后关闭预览');
+  const finalTexts = await page.$$eval('#cueTbody tr textarea', tas => tas.map(t => t.value));
+  ok(finalTexts.includes('新文本内容'), '合并后文本已更新');
+  ok(!finalTexts.includes('只在当前版'), '仅当前版已删除');
+  ok(finalTexts.some(t => t.includes('只在对照版')), '仅对照版已插入');
+  ok(finalTexts.includes('一句很长的话') && finalTexts.includes('被拆成了两半内容'), '一对多拆分生效');
+  // 时间顺序
+  const finalStarts = await page.$$eval('#cueTbody tr input[data-field="start"]', ins => ins.map(i => i.value));
+  let ord = true;
+  for (let i = 1; i < finalStarts.length; i++) {
+    const p = finalStarts[i - 1].match(/(\d+):(\d+):(\d+),(\d+)/);
+    const q = finalStarts[i].match(/(\d+):(\d+):(\d+),(\d+)/);
+    const a = ((+p[1] * 60 + +p[2]) * 60 + +p[3]) * 1000 + +p[4];
+    const b = ((+q[1] * 60 + +q[2]) * 60 + +q[3]) * 1000 + +q[4];
+    if (b < a) ord = false;
+  }
+  ok(ord, '合并后时间顺序不被破坏');
+  // 撤销批量
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(200);
+  ok((await page.locator('#cueTbody tr').count()) === 5, '撤销批量恢复原始条数');
+  await page.keyboard.press('Control+y');
+  await page.waitForTimeout(200);
+
+  // 切回校准台 / 再进对照
+  await page.locator('#btnCompareView').click();
+  await page.waitForTimeout(100);
+  ok(await page.locator('#compareView').isHidden(), '切回校准台');
+  await page.locator('#btnCompareView').click();
+  await page.waitForTimeout(100);
+  ok(await page.locator('#compareView').isVisible(), '再次进入对照视图');
+
+  // 冲突手动处理：构造一个低置信度对照（同时同地、文字完全无关）
+  const ambRef = [
+    'WEBVTT', '',
+    '00:00:01.000 --> 00:00:02.000', '苹果香蕉橙子葡萄西瓜芒果榴莲', '',
+    '00:00:03.000 --> 00:00:04.000', '桌子椅子门窗电脑键盘书本钢笔', '',
+  ].join('\n');
+  await page.locator('#fileInput').setInputFiles({ name: 'amb.srt', mimeType: 'text/plain',
+    buffer: Buffer.from([
+      '1', '00:00:01,000 --> 00:00:02,000', '苹果香蕉橙子葡萄西瓜芒果榴莲', '',
+      '2', '00:00:03,000 --> 00:00:04,000', '旧文', '',
+    ].join('\n')) });
+  await page.waitForTimeout(200);
+  await page.locator('#compareInput').setInputFiles({ name: 'amb-ref.vtt', mimeType: 'text/vtt', buffer: Buffer.from(ambRef) });
+  await page.waitForTimeout(200);
+  await page.locator('#cmpFilter').selectOption('conflict');
+  const conflictRows = await page.locator('#cmpTbody tr.row-conflict').count();
+  ok(conflictRows >= 1, `低置信度配对标为冲突（${conflictRows} 行），不自动选边`);
+  // 批量默认不含冲突
+  await page.locator('#cmpFilter').selectOption('all');
+  await page.locator('#btnBatchMerge').click();
+  await page.waitForTimeout(200);
+  const planHasConflictRow = await page.locator('#mergeTbody tr').evaluateAll(
+    trs => trs.filter(tr => tr.textContent.includes('苹果香蕉') || tr.textContent.includes('桌子椅子')).length);
+  ok(planHasConflictRow === 0, '批量预览不包含冲突项');
+  await page.locator('#btnMergeCancel').click();
+
+  // 对照文件不入库：草稿 POST 内容不得整段包含未采用的独有对照文本
+  await page.waitForTimeout(1200);
+  const leakedRef = reqBodies.some(b => b.includes('桌子椅子门窗电脑键盘书本钢笔') && !b.includes('苹果香蕉'));
+  ok(!leakedRef, '未采用的对照独有内容不写入草稿 / 不上传');
+
+  // 刷新后对照需重新选择（当前字幕草稿仍提示）
+  await page.locator('#btnCompareClose').click();
+  await page.waitForTimeout(100);
+  ok(await page.locator('#btnCompareView').isHidden(), '关闭对照后入口隐藏');
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForFunction(() => document.querySelectorAll('#cueTbody tr').length > 0, null, { timeout: 5000 });
+  await page.waitForTimeout(400);
+  ok(await page.locator('#btnCompareView').isHidden(), '刷新后对照文件需重新选择（不持久化）');
+  if (await page.locator('#draftBanner').isVisible()) await page.locator('#btnDraftDismiss').click();
+
   // ---- 控制台错误 ----
   const realErrors = errors.filter(e => !e.includes('favicon'));
   ok(realErrors.length === 0, '浏览器无 JS 错误' + (realErrors.length ? '：' + realErrors.join(' | ') : ''));

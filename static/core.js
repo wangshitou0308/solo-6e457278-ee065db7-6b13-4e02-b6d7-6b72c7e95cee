@@ -701,8 +701,9 @@
     if (!n) return m;
     if (!m) return n;
     if (n * m > 160000) {
-      // 超长文本的防御性上界：退化为“较短长度 / 较长长度”，避免平方级开销
-      return Math.max(n, m) - Math.min(n, m);
+      // 超长文本的防御性回退：字符二元组 Dice 系数（多集合交集），
+      // 线性开销。等长但内容不同的文本（如 401 字异文）不会被误判为距离 0。
+      return Math.round((1 - bigramDice(a, b)) * Math.max(n, m));
     }
     var prev = [], cur = [], k;
     for (k = 0; k <= m; k++) prev[k] = k;
@@ -721,8 +722,33 @@
   // 规范化文本相似度 0..1（编辑距离比例）
   function textSimilarity(a, b) {
     if (!a && !b) return 1;
+    var n = a.length, m = b.length;
+    if (n * m > 160000) {
+      // 超长文本走线性的二元组 Dice，避免平方级 LCS/编辑距离开销，
+      // 同时保证等长异文不会得到相似度 1。
+      return bigramDice(a, b);
+    }
     var d = levenshtein(a, b);
     return 1 - d / Math.max(a.length, b.length);
+  }
+
+  // 字符二元组 Dice 系数（多集合计数）：完全不同→0，完全一致→1
+  function bigramDice(a, b) {
+    function grams(s) {
+      var m = new Map();
+      for (var k = 0; k + 1 < s.length; k++) {
+        var g = s.slice(k, k + 2);
+        m.set(g, (m.get(g) || 0) + 1);
+      }
+      return m;
+    }
+    if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
+    var ga = grams(a), gb = grams(b), inter = 0;
+    ga.forEach(function (cnt, g) {
+      var cb = gb.get(g);
+      if (cb) inter += Math.min(cnt, cb);
+    });
+    return 2 * inter / (a.length - 1 + b.length - 1);
   }
 
   function groupNormText(cues, start, len) {
@@ -846,6 +872,11 @@
               var touchesB = y < e.bj + e.blen && y + lb > e.bj;
               if (sameA && sameB) continue;
               if (!(touchesA || touchesB)) continue;
+              // 两侧区间都被当前组完全包含 → 只是组内的一种子配对，
+              // 不是竞争性的另一种整体划分（由内聚性检查单独判断）。
+              var containedA = x >= e.ai && x + la <= e.ai + e.alen;
+              var containedB = y >= e.bj && y + lb <= e.bj + e.blen;
+              if (containedA && containedB && (la !== e.alen || lb !== e.blen)) continue;
               var s = blockScore(x, la, y, lb);
               if (s !== null && s > bestAltScore) bestAltScore = s;
             }
@@ -864,9 +895,12 @@
       var ga = groupSpan(cuesA, e.ai, e.alen), gb = groupSpan(cuesB, e.bj, e.blen);
       var rawA = groupRawText(cuesA, e.ai, e.alen);
       var rawB = groupRawText(cuesB, e.bj, e.blen);
-      var sim = textSimilarity(normalizeText(rawA), normalizeText(rawB));
       e.aRaw = rawA; e.bRaw = rawB;
-      e.textChanged = sim < 0.985;
+      // 规范化后逐字符比较即为“有无文字变化”的精确信号
+      // （标点 / 空白 / 大小写 / HTML 标签差异已在规范化时忽略，Dice 阈值不会漏判小修改）。
+      var normA = normalizeText(rawA), normB = normalizeText(rawB);
+      e.similarity = normA && normB ? textSimilarity(normA, normB) : (normA === normB ? 1 : 0);
+      e.textChanged = normA !== normB;
       e.dStart = gb.start - ga.start;
       e.dEnd = gb.end - ga.end;
       e.timeChanged = e.alen === 1 && e.blen === 1
@@ -883,13 +917,22 @@
         e.conflict = true;
         e.reasons.push('存在得分接近的其它配对（' + Math.round(alt * 100) + '%），配对方式不唯一');
       }
-      // 一对多 / 多对一的内聚性：组内任一单配几乎和整体同样好 → 分组依据不足
+      // 一对多 / 多对一的内聚性：若把整组缩成任意“一对一”子配对，
+      // 其覆盖率折算得分仍与整组接近，则分组依据不足。覆盖率 = 子配对时长 / 整组时长，
+      // 这样完美合并时单配即使文本相同，也只覆盖一半 → 折算约半分，不会误报。
       if (e.alen > 1 || e.blen > 1) {
+        var gSpanA = groupSpan(cuesA, e.ai, e.alen);
+        var gSpanB = groupSpan(cuesB, e.bj, e.blen);
+        var gDur = Math.max(gSpanA.end - gSpanA.start, gSpanB.end - gSpanB.start, 1);
         var bestSingle = -1;
         for (var x = e.ai; x < e.ai + e.alen; x++) {
           for (var y = e.bj; y < e.bj + e.blen; y++) {
-            var s = blockScore(x, 1, y, 1);
-            if (s !== null && s > bestSingle) bestSingle = s;
+            var sSingle = blockScore(x, 1, y, 1);
+            if (sSingle === null) continue;
+            var pA = groupSpan(cuesA, x, 1), pB = groupSpan(cuesB, y, 1);
+            var cov = Math.min(pA.end - pA.start, pB.end - pB.start) / gDur;
+            var adjusted = sSingle * Math.max(0.35, Math.min(1, cov + 0.15));
+            if (adjusted > bestSingle) bestSingle = adjusted;
           }
         }
         if (bestSingle >= 0 && e.score - bestSingle <= cfg.GROUP_TIE) {
@@ -909,6 +952,33 @@
   function diffSegments(a, b) {
     var A = codePoints(a), B = codePoints(b);
     var n = A.length, m = B.length;
+    // 超长文本不构造平方级字符 LCS 表：退化为按行 LCS（行数通常很少），
+    // 差异段以整行 + 换行粒度输出，渲染与字符级一致。
+    if (n * m > 250000) {
+      var LA = String(a).split('\n'), LB = String(b).split('\n');
+      var nL = LA.length, mL = LB.length, T = [];
+      for (var r0 = 0; r0 <= nL; r0++) T.push(new Array(mL + 1).fill(0));
+      for (r0 = nL - 1; r0 >= 0; r0--) {
+        for (var c0 = mL - 1; c0 >= 0; c0--) {
+          T[r0][c0] = LA[r0] === LB[c0] ? T[r0 + 1][c0 + 1] + 1
+            : Math.max(T[r0 + 1][c0], T[r0][c0 + 1]);
+        }
+      }
+      var lineSegs = [], li = 0, lj = 0;
+      function linePush(t, s) {
+        var last = lineSegs[lineSegs.length - 1];
+        if (last && last.t === t) last.s += s;
+        else lineSegs.push({ t: t, s: s });
+      }
+      while (li < nL && lj < mL) {
+        if (LA[li] === LB[lj]) { linePush('eq', LA[li] + '\n'); li++; lj++; }
+        else if (T[li + 1][lj] >= T[li][lj + 1]) { linePush('del', LA[li] + '\n'); li++; }
+        else { linePush('ins', LB[lj] + '\n'); lj++; }
+      }
+      while (li < nL) { linePush('del', LA[li] + (li < nL - 1 ? '\n' : '')); li++; }
+      while (lj < mL) { linePush('ins', LB[lj] + (lj < mL - 1 ? '\n' : '')); lj++; }
+      return lineSegs;
+    }
     var lcs = [];
     for (var i = 0; i <= n; i++) lcs.push(new Array(m + 1).fill(0));
     for (i = n - 1; i >= 0; i--) {
@@ -1100,47 +1170,179 @@
     return res;
   }
 
-  // ---------- 批量合并计划（模拟应用，不修改输入） ----------
+  // ---------- 批量合并计划（两阶段模拟，不修改输入） ----------
   // actions: { [entryIdx]: 'text'|'time'|'full'|'group'|'insert'|'delete' }
-  // 按时间轴顺序逐条模拟；当前条件下不可应用的条目进 blocked 并跳过，不影响其余条目。
-  // 返回 { cues, applied:[{idx,mode}], blocked:[{idx,mode,reason}] }。
+  //
+  // 阶段一：先执行全部 only-a 删除；阶段二：按条目顺序执行其余操作。
+  // 这样“删除”不会因排在后面而让前面的 insert 误判间隙冲突，反之亦然。
+  // 插入 / 替换的间隙校验同时查看右侧尚未处理条目的“将来目标状态”，
+  // 而不是其当前时间，避免 insert 先被阻塞、delete 随后成功的依赖问题。
+  // 当前条件下不可应用的条目进 blocked 并跳过，不影响其余条目。
+  // 返回 { cues, applied, blocked:[{idx,mode,reason}] }。
   function planMerge(cues, refCues, entries, actions, format) {
     var w = cues.map(cloneCue);
-    var delta = 0;
+    var wRef = cues.map(function (c, k) { return { kind: 'keep', ai: k }; });
     var applied = [], blocked = [];
     function fail(idx, mode, reason) { blocked.push({ idx: idx, mode: mode, reason: reason }); }
+
+    // 处理位置 pos（条目数组下标）右侧、尚未处理条目中将占用的最早起点。
+    // “右侧”按插入时刻的当前版位置 afterPos 判定，而不是数组顺序。
+    //   Infinity：右侧无条目；null：右侧紧接不占位内容（继续跳过）
+    function futureRightStart(pos, delSet, afterPos) {
+      for (var p = pos; p < entries.length; p++) {
+        var f = entries[p];
+        var fm = actions[p];
+        if (f.kind === 'only-a') {
+          if (f.ai < afterPos) continue;             // 在插入点左侧
+          if (delSet.has(p)) continue;               // 将被删除，不占位
+          return cues[f.ai].start;
+        }
+        if (f.kind === 'only-b') {
+          if (f.aBefore < afterPos) continue;        // 属于更靠左的间隙
+          return fm === 'insert' ? refCues[f.bj].start : null;
+        }
+        // pair：整组位于插入点左侧则跳过
+        if (f.ai + f.alen <= afterPos) continue;
+        if (fm === 'full' || fm === 'time' || fm === 'group') return refCues[f.bj].start;
+        return cues[f.ai].start;                     // text / 未操作：时间不变
+      }
+      return Infinity;
+    }
+    function firstFinite(a, b) {
+      if (a === null) return b;
+      if (b === null) return a;
+      if (a === Infinity) return b;
+      if (b === Infinity) return a;
+      return Math.min(a, b);
+    }
+
+    // ---------- 阶段一：删除（按当前版位置倒序，避免索引漂移） ----------
+    var delSet = new Set();
+    var delA = [];
+    entries.forEach(function (e, idx) {
+      if (e.kind === 'only-a' && actions[idx] === 'delete') {
+        delSet.add(idx);
+        delA.push({ e: e, idx: idx });
+      }
+    });
+    delA.sort(function (x, y) { return y.e.ai - x.e.ai; });
+    delA.forEach(function (d) {
+      if (d.e.ai < 0 || d.e.ai >= w.length) { fail(d.idx, 'delete', '当前版条目索引已失效，请重新生成预览'); return; }
+      var res = deleteOnlyA(w, d.e.ai, format);
+      if (res.error) { fail(d.idx, 'delete', res.error); delSet.delete(d.idx); return; }
+      w = res.cues;
+      wRef.splice(d.e.ai, 1);
+      applied.push({ idx: d.idx, mode: 'delete' });
+    });
+
+    // ---------- 阶段二：pair 采用 + only-b 插入，按条目顺序 ----------
+    function curIndex(ai) {
+      var removedBefore = 0;
+      delSet.forEach(function (p) { if (entries[p].ai < ai) removedBefore++; });
+      return ai - removedBefore;
+    }
+    // shiftBefore[ai]：当前版第 ai 条“之前”（即间隙 ai）已发生的净条数变化
+    // （成功的组替换 blen−alen 与间隙插入 +1）。长度 n+1 以容纳末尾间隙。
+    var shiftBefore = new Array(cues.length + 1).fill(0);
+    function addShift(fromAi, d) {
+      for (var k = fromAi; k < shiftBefore.length; k++) shiftBefore[k] += d;
+    }
+    // 当前版条目 ai 在工作数组中的下标（删除在阶段一已发生，组替换 / 插入在此累计）
+    function workIndex(ai) {
+      return curIndex(ai) + (shiftBefore[ai] || 0);
+    }
+    // 间隙 aBefore 的插入下标（删除已计入 curIndex，组替换 / 插入计入 shiftBefore）
+    function gapIndex(aBefore) {
+      return curIndex(aBefore) + (shiftBefore[aBefore] || 0);
+    }
+
     entries.forEach(function (e, idx) {
       var mode = actions[idx];
-      if (!mode) return;
       var res;
       if (e.kind === 'pair') {
-        var at = e.ai + delta;
+        // 防御：对照侧索引失效（对照条目不存在）→ 列入阻塞而非崩溃
+        if (e.bj < 0 || e.bj + e.blen > refCues.length) {
+          if (mode) fail(idx, mode, '对照条目索引已失效，请重新生成预览');
+          return;
+        }
+        var at = workIndex(e.ai);
+        if (mode && (at < 0 || at + e.alen > w.length)) {
+          fail(idx, mode, '目标位置已失效（结构被先前操作改变），请重新生成预览');
+          return;
+        }
         if (mode === 'text') {
           if (e.alen !== 1 || e.blen !== 1) { fail(idx, mode, '仅一对一可采用文本'); return; }
           res = adoptText(w, at, refCues[e.bj].lines);
-        } else if (mode === 'time') {
-          if (e.alen !== 1 || e.blen !== 1) { fail(idx, mode, '仅一对一可采用时间'); return; }
-          res = adoptTime(w, at, refCues[e.bj].start, refCues[e.bj].end);
-        } else if (mode === 'full') {
-          if (e.alen !== 1 || e.blen !== 1) { fail(idx, mode, '结构不同请使用整组采用'); return; }
-          res = adoptFull(w, at, refCues[e.bj], format);
+        } else if (mode === 'time' || mode === 'full') {
+          if (e.alen !== 1 || e.blen !== 1) {
+            fail(idx, mode, '结构不同请使用整组采用'); return;
+          }
+          var r1 = refCues[e.bj];
+          var rs1 = futureRightStart(idx + 1, delSet, e.ai + 1);
+          if (rs1 !== null && rs1 !== Infinity && r1.end > rs1) {
+            fail(idx, mode, '采用后终点晚于后序条目的目标起点 ' + fmtMs(rs1, 'srt') +
+              '（请先处理后续条目或手动调整）');
+            return;
+          }
+          res = mode === 'time'
+            ? adoptTime(w, at, r1.start, r1.end)
+            : adoptFull(w, at, r1, format);
         } else if (mode === 'group') {
+          var newLast = refCues[e.bj + e.blen - 1];
+          var rs3 = futureRightStart(idx + 1, delSet, e.ai + e.alen);
+          if (rs3 !== null && rs3 !== Infinity && newLast.end > rs3) {
+            fail(idx, mode, '整组采用后末条终点晚于后序条目的目标起点 ' + fmtMs(rs3, 'srt') +
+              '（请先处理后续条目或手动调整）');
+            return;
+          }
           res = replaceGroup(w, at, e.alen, refCues, e.bj, e.blen, format);
-          if (!res.error) delta += e.blen - e.alen;
-        } else { fail(idx, mode, '未知操作'); return; }
+          if (!res.error) {
+            var refs = [];
+            for (var k = 0; k < e.blen; k++) refs.push({ kind: 'ref', bj: e.bj + k });
+            wRef.splice.apply(wRef, [at, e.alen].concat(refs));
+            // 组替换的净增从当前侧“第一条之后”的间隙开始计入
+            // （1→2 新条插在 e.ai+1；2→1 净变化为 0）
+            addShift(e.ai + 1, e.blen - e.alen);
+          }
+        } else {
+          return;   // 未选择操作
+        }
         if (res.error) fail(idx, mode, res.error);
         else { w = res.cues; applied.push({ idx: idx, mode: mode }); }
-      } else if (e.kind === 'only-b' && mode === 'insert') {
-        res = insertOnlyB(w, e.aBefore + delta, refCues[e.bj], format);
-        if (res.error) fail(idx, mode, res.error);
-        else { w = res.cues; delta += 1; applied.push({ idx: idx, mode: mode }); }
-      } else if (e.kind === 'only-a' && mode === 'delete') {
-        res = deleteOnlyA(w, e.ai + delta, format);
-        if (res.error) fail(idx, mode, res.error);
-        else { w = res.cues; delta -= 1; applied.push({ idx: idx, mode: mode }); }
-      } else {
-        fail(idx, mode, '操作与条目类型不匹配');
+        return;
       }
+      if (e.kind === 'only-b' && mode === 'insert') {
+        var gpos = gapIndex(e.aBefore);
+        var r = refCues[e.bj];
+        if (!r) { fail(idx, 'insert', '对照条目索引失效（对照文件可能已变化）'); return; }
+        if (gpos < 0 || gpos > w.length) {
+          fail(idx, 'insert', '插入位置失效（结构已被先前操作改变），请关闭批量预览重试');
+          return;
+        }
+        var leftEnd = gpos > 0 ? w[gpos - 1].end : -Infinity;
+        // 右邻只认前向扫描结果（严格位于该间隙之后）；gpos 处当前若是占位则兜底
+        var rightStart = futureRightStart(idx + 1, delSet, e.aBefore + 1);
+        if (rightStart === null && gpos < w.length) rightStart = w[gpos].start;
+        if (r.start < leftEnd) {
+          fail(idx, 'insert', '对照条与上一条重叠（早于 ' + fmtMs(leftEnd, 'srt') +
+            '，该间隙的删除 / 采用未全部生效）');
+          return;
+        }
+        if (rightStart !== Infinity && r.end > rightStart) {
+          fail(idx, 'insert', '对照条与下一条重叠（晚于 ' + fmtMs(rightStart, 'srt') +
+            '，该间隙的删除 / 采用未全部生效）');
+          return;
+        }
+        res = insertOnlyB(w, gpos, r, format);
+        if (res.error) { fail(idx, 'insert', res.error); return; }
+        w = res.cues;
+        wRef.splice(gpos, 0, { kind: 'ref', bj: e.bj });
+        addShift(e.aBefore, 1);
+        applied.push({ idx: idx, mode: 'insert' });
+        return;
+      }
+      if (e.kind === 'only-a' && delSet.has(idx)) return;   // 阶段一已处理
+      if (mode) fail(idx, mode, '操作与条目类型不匹配');
     });
     return { cues: w, applied: applied, blocked: blocked };
   }

@@ -413,5 +413,247 @@ eq(rw(['一二三四五六七八九十一二三四五六七八九'], 10, 2).line
   eq(planCues[1].lines.length, 1, '批量计划不修改原数据');
 }
 
+// ---- 版本对照：规范化与相似度 ----
+function mkCue(num, s, e, lines, settings, autoNum) {
+  return { num: String(num), start: s, end: e, settings: settings || '',
+    lines: Array.isArray(lines) ? lines : [lines], autoNum: autoNum };
+}
+// 回归①：两段 401 字等长异文不得得到相似度 1，也不得标为无文字变化
+{
+  const s1 = '一'.repeat(401), s2 = '二'.repeat(401);
+  const sim = Core.textSimilarity(Core.normalizeText(s1), Core.normalizeText(s2));
+  ok(sim < 0.05, '401 字等长异文相似度接近 0（实际 ' + sim.toFixed(3) + '），不再返回 1');
+  const al = Core.alignDocuments([mkCue(1, 0, 1000, s1)], [mkCue(1, 0, 1000, s2)]);
+  eq(al.entries[0].textChanged, true, '401 字异文必须标记文字变化');
+  ok(al.entries[0].conflict === true, '401 字异文（同时间但文字全不同）标为冲突，不自动选边');
+  // 等长同文仍无变化
+  const same = '同'.repeat(401);
+  const al2 = Core.alignDocuments([mkCue(1, 0, 1000, same)], [mkCue(1, 0, 1000, same)]);
+  eq(al2.entries[0].textChanged, false, '401 字同文不标文字变化');
+  eq(al2.entries[0].timeChanged, false, '401 字同文同时间不标时间变化');
+  // 长文本仅改两字也要检出（不被相似度阈值漏判）
+  const longBase = '这是一段比较长的中文内容用来测试相似度计算需要足够字数触发二元组回退路径'.repeat(6);
+  const longMod = longBase.slice(0, 100) + '改字' + longBase.slice(102);
+  const al3 = Core.alignDocuments([mkCue(1, 0, 1000, longBase)], [mkCue(1, 0, 1000, longMod)]);
+  eq(al3.entries[0].textChanged, true, '长文本改 2 字仍检出文字变化');
+}
+// 规范化忽略标点 / 空白 / 大小写 / 全半角 / HTML 标签
+{
+  eq(Core.normalizeText('你好， 世界！'), Core.normalizeText('你好世界'), '规范化忽略标点空白');
+  eq(Core.normalizeText('Hello  WORLD'), Core.normalizeText('helloworld'), '规范化忽略大小写');
+  eq(Core.normalizeText('<i>ABC</i>'), Core.normalizeText('abc'), '规范化忽略 HTML 标签');
+  eq(Core.normalizeText('ＨＥＬＬＯ'), Core.normalizeText('hello'), '全角字母转半角');
+}
+
+// ---- 对齐：一对一 / 一对多 / 多对一 / 两侧独有 ----
+{
+  const A = [
+    mkCue(1, 1000, 2000, '你好世界'),
+    mkCue(2, 3000, 4000, '旧文本内容'),
+    mkCue(3, 5000, 6000, '只在当前版'),
+    mkCue(4, 7000, 10000, '一句很长的话被拆成了两半内容'),
+    mkCue(6, 11000, 12000, '多'),
+    mkCue(7, 12100, 13000, '对一'),
+  ];
+  const B = [
+    mkCue(1, 1500, 2500, '你好世界'),
+    mkCue(2, 3000, 4000, '新文本内容'),
+    mkCue(4, 7000, 8500, '一句很长的话'),
+    mkCue(5, 8500, 10000, '被拆成了两半内容'),
+    mkCue(6, 11000, 13000, '多对一'),
+    mkCue(8, 14000, 15000, '只在对照版'),
+  ];
+  const r = Core.alignDocuments(A, B);
+  const kinds = r.entries.map(e => e.kind);
+  eq(kinds[0], 'pair', '第 1 对：一对一');
+  eq([r.entries[0].timeChanged, r.entries[0].textChanged], [true, false], '仅时间偏移');
+  eq([r.entries[1].timeChanged, r.entries[1].textChanged], [false, true], '仅文字变化');
+  eq(kinds[2], 'only-a', '仅当前版');
+  const oneToMany = r.entries.find(e => e.kind === 'pair' && e.alen === 1 && e.blen === 2);
+  ok(oneToMany, '识别一对多');
+  const manyToOne = r.entries.find(e => e.kind === 'pair' && e.alen === 2 && e.blen === 1);
+  ok(manyToOne, '识别多对一');
+  ok(kinds.includes('only-b'), '识别仅对照版');
+  // 纯偏移不冲突、同文 +500ms 高置信
+  eq(r.entries[0].conflict, false, '同文时间偏移不冲突');
+}
+// 低置信度：同时同地但文字完全无关 → 冲突
+{
+  const r = Core.alignDocuments(
+    [mkCue(1, 0, 3000, '苹果香蕉橙子葡萄西瓜芒果榴莲')],
+    [mkCue(1, 0, 3000, '桌子椅子门窗电脑键盘书本钢笔')]);
+  eq(r.entries[0].conflict, true, '无关文本即使重叠也标冲突');
+  ok(/置信度/.test(r.entries[0].reasons.join(' ')), '给出低置信度原因');
+}
+// 两种配对得分接近 → 冲突（不自动选边）
+{
+  // A2 与 B2 文本相同但时间稍远；A1 与 B1/B2 都重叠且文本都有部分相似
+  const A = [mkCue(1, 0, 2000, '甲乙丙丁戊'), mkCue(2, 2100, 4000, '共同的句子内容一二三四')];
+  const B = [mkCue(1, 0, 2000, '甲乙丙丁戊'), mkCue(2, 2050, 4000, '共同的句子内容一二三四五六')];
+  const r = Core.alignDocuments(A, B);
+  const e1 = r.entries.find(e => e.kind === 'pair' && e.ai === 0);
+  ok(e1, '首条配对存在');
+}
+
+// ---- 字符级差异 ----
+{
+  const segs = Core.diffSegments('你好世界ABC', '你好地球ABC');
+  const del = segs.filter(s => s.t === 'del').map(s => s.s).join('');
+  const ins = segs.filter(s => s.t === 'ins').map(s => s.s).join('');
+  eq(del, '世界', '差异段标出删除「世界」');
+  eq(ins, '地球', '差异段标出插入「地球」');
+}
+
+// ---- 单项采用 ----
+{
+  const A = [
+    { num: '1', start: 0, end: 1000, settings: '', lines: ['旧文本'], autoNum: true },
+    { num: '2', start: 1100, end: 2000, settings: '', lines: ['下一条'], autoNum: true },
+  ];
+  // 采用文本
+  let r = Core.adoptText(A, 0, ['新文本']);
+  eq(r.cues[0].lines, ['新文本'], '采用文本更新 lines');
+  eq([r.cues[0].start, r.cues[0].end], [0, 1000], '采用文本不动时间');
+  eq(A[0].lines, ['旧文本'], '采用文本不修改输入');
+  // 空文本拒绝
+  r = Core.adoptText(A, 0, ['  ']);
+  ok(/为空/.test(r.error), '空文本拒绝采用');
+  // 采用时间
+  r = Core.adoptTime(A, 0, 200, 900);
+  eq([r.cues[0].start, r.cues[0].end], [200, 900], '采用时间更新区间');
+  // 倒序 / 与邻居重叠拒绝
+  r = Core.adoptTime(A, 0, 0, 1200);
+  ok(/重叠|倒序/.test(r.error), '采用时间越过邻居拒绝：' + r.error);
+  r = Core.adoptTime(A, 0, 900, 800);
+  ok(/晚于/.test(r.error), '结束早于开始拒绝');
+}
+// 整条采用：VTT cue 标识与设置保留规则
+{
+  // 当前版有显式标识 → 保留当前标识；settings 当前非空优先
+  const cur = [{ num: 'cue-a', start: 0, end: 1000, settings: 'align:start', lines: ['旧'], autoNum: false },
+    { num: '2', start: 2000, end: 3000, settings: '', lines: ['尾'], autoNum: true }];
+  const ref = { num: 'cue-r', start: 100, end: 900, settings: 'line:80%', lines: ['新'], autoNum: false };
+  let r = Core.adoptFull(cur, 0, ref, 'vtt');
+  eq(r.cues[0].num, 'cue-a', '整条采用保留当前显式 cue 标识');
+  eq(r.cues[0].settings, 'align:start', '整条采用保留当前非空 settings');
+  eq(r.cues[0].lines, ['新'], '整条采用更新文本');
+  eq(r.cues[0].start, 100, '整条采用更新时间');
+  // 当前版为自动编号 → 沿用对照版显式标识与设置
+  const cur2 = [{ num: '1', start: 0, end: 1000, settings: '', lines: ['旧'], autoNum: true },
+    { num: '2', start: 2000, end: 3000, settings: '', lines: ['尾'], autoNum: true }];
+  r = Core.adoptFull(cur2, 0, ref, 'vtt');
+  eq(r.cues[0].num, 'cue-r', '当前无标识时沿用对照版标识');
+  eq(r.cues[0].settings, 'line:80%', '当前无设置时采用对照版设置');
+  eq(r.cues[0].autoNum, false, '沿用后为显式标识');
+}
+
+// ---- 整组替换（一对多 / 多对一） ----
+{
+  const A = [mkCue(1, 7000, 10000, '一句很长的话被拆成了两半内容'), mkCue(2, 11000, 12000, '尾')];
+  const B = [mkCue(4, 7000, 8500, '一句很长的话'), mkCue(5, 8500, 10000, '被拆成了两半内容'), mkCue(6, 14000, 15000, '无关')];
+  let r = Core.replaceGroup(A, 0, 1, B, 0, 2, 'srt');
+  eq(r.cues.length, 3, '1→2 组替换条数 +1');
+  eq(r.cues.map(c => c.start).join(','), '7000,8500,11000', '组替换时间正确');
+  eq(r.cues.map(c => c.num).join(','), '1,2,3', 'SRT 组替换后重编号');
+  // 多对一 2→1
+  const A2 = [mkCue(1, 11000, 12000, '多'), mkCue(2, 12100, 13000, '对一'), mkCue(3, 14000, 15000, '尾')];
+  const B2 = [mkCue(6, 11000, 13000, '多对一')];
+  r = Core.replaceGroup(A2, 0, 2, B2, 0, 1, 'srt');
+  eq(r.cues.length, 2, '2→1 组替换条数 -1');
+  eq([r.cues[0].start, r.cues[0].end], [11000, 13000], '多对一时间覆盖');
+  // VTT 1→2：首段保留当前标识，后段保留对照 cue 标识
+  const vA = [{ num: 'cue-a', start: 1000, end: 4000, settings: 'align:start', lines: ['组内容拆分测试'], autoNum: false }];
+  const vB = [
+    { num: 'cue-b1', start: 1000, end: 2500, settings: '', lines: ['组内容'], autoNum: false },
+    { num: 'cue-b2', start: 2500, end: 4000, settings: 'line:50%', lines: ['拆分测试'], autoNum: false },
+  ];
+  r = Core.replaceGroup(vA, 0, 1, vB, 0, 2, 'vtt');
+  eq(r.cues[0].num, 'cue-a', 'VTT 首段保留当前标识');
+  eq(r.cues[0].settings, 'align:start', 'VTT 首段保留当前设置');
+  eq(r.cues[1].num, 'cue-b2', 'VTT 后段保留对照标识');
+  eq(r.cues[1].settings, 'line:50%', 'VTT 后段保留对照设置');
+  // 组与邻居冲突拒绝
+  const bad = [mkCue(1, 0, 1000, '前'), mkCue(2, 1100, 4000, '将被组替换')];
+  const badB = [mkCue(9, 900, 2000, '新组'), mkCue(10, 2000, 3000, 'x')];
+  r = Core.replaceGroup(bad, 1, 1, badB, 0, 2, 'srt');
+  ok(/重叠|倒序/.test(r.error), '组替换与上一条冲突拒绝：' + r.error);
+}
+
+// ---- 仅对照插入 / 仅当前删除 ----
+{
+  const A = [mkCue(1, 0, 1000, 'a'), mkCue(2, 3000, 4000, 'b')];
+  let r = Core.insertOnlyB(A, 1, mkCue(9, 1500, 2500, '插入'), 'srt');
+  eq(r.cues.map(c => c.start).join(','), '0,1500,3000', '插入到间隙中');
+  eq(r.cues.map(c => c.num).join(','), '1,2,3', '插入后重编号');
+  r = Core.insertOnlyB(A, 1, mkCue(9, 900, 3100, '重叠'), 'srt');
+  ok(/重叠/.test(r.error), '插入重叠拒绝（左）');
+  r = Core.insertOnlyB(A, 1, mkCue(9, 2500, 3100, '重叠'), 'srt');
+  ok(/重叠/.test(r.error), '插入重叠拒绝（右）');
+  // VTT 插入保留对照显式标识
+  r = Core.insertOnlyB(
+    [{ num: 'cue-a', start: 0, end: 1000, settings: '', lines: ['a'], autoNum: false }],
+    1, { num: 'cue-new', start: 2000, end: 3000, settings: 'line:10%', lines: ['新'], autoNum: false },
+    'vtt');
+  eq(r.cues[1].num, 'cue-new', 'VTT 插入保留对照标识');
+  eq(r.cues[1].settings, 'line:10%', 'VTT 插入保留对照设置');
+  // 删除
+  r = Core.deleteOnlyA([mkCue(1, 0, 1, 'a'), mkCue(2, 2, 3, 'b')], 0, 'srt');
+  eq(r.cues.map(c => c.num).join(','), '1', '删除后重编号');
+}
+
+// ---- 回归②：批量 insert/delete 按依赖安全执行（两阶段） ----
+{
+  // 条目顺序：pair → only-b（插入到间隙）→ only-a（删除占位条）→ pair。
+  // 旧的单遍模拟会先阻塞 insert（占位条还在），随后 delete 成功，最终丢失对照条。
+  const A = [mkCue(1, 0, 1000, '保留开头'), mkCue(2, 2000, 3000, '占位将删除'), mkCue(3, 4000, 5000, '保留结尾')];
+  const B = [mkCue(1, 0, 1000, '保留开头'), mkCue(2, 2100, 2900, '对照新句'), mkCue(3, 4000, 5000, '保留结尾')];
+  const entries = [
+    { kind: 'pair', ai: 0, alen: 1, bj: 0, blen: 1, score: 1, conflict: false,
+      textChanged: false, timeChanged: false },
+    { kind: 'only-b', bj: 1, aBefore: 1 },
+    { kind: 'only-a', ai: 1 },
+    { kind: 'pair', ai: 2, alen: 1, bj: 2, blen: 1, score: 1, conflict: false,
+      textChanged: false, timeChanged: false },
+  ];
+  const actions = { 1: 'insert', 2: 'delete' };
+  const p = Core.planMerge(A, B, entries, actions, 'srt');
+  eq(p.blocked.length, 0, '两阶段执行：insert 不再被误阻塞（blocked=' +
+    p.blocked.map(b => b.reason).join(';') + '）');
+  eq(p.cues.length, 3, '替换后仍是 3 条（删除 1 + 插入 1），不会只剩 2 条');
+  eq(p.cues.map(c => c.lines.join()).indexOf('对照新句') >= 0, true, '对照新句已插入');
+  eq(p.cues.map(c => c.lines.join()).indexOf('占位将删除') === -1, true, '占位条已删除');
+  eq(p.cues.map(c => c.start).join(','), '0,2100,4000', '时间顺序保持');
+}
+// 批量：文本/时间/整条 + 组替换混合应用，纯函数不修改输入
+{
+  const A = [
+    mkCue(1, 1000, 2000, '你好世界'),
+    mkCue(2, 3000, 4000, '旧'),
+    mkCue(3, 5000, 8000, '一整句需要被拆开内容'),
+  ];
+  const B = [
+    mkCue(1, 1500, 2500, '你好世界'),
+    mkCue(2, 3000, 4000, '新'),
+    mkCue(3, 5000, 6500, '一整句需要被'),
+    mkCue(4, 6500, 8000, '拆开内容'),
+  ];
+  const r = Core.alignDocuments(A, B);
+  const actions = {};
+  r.entries.forEach((e, i) => {
+    if (e.kind !== 'pair') return;
+    actions[i] = (e.alen > 1 || e.blen > 1) ? 'group' : 'full';
+  });
+  const p = Core.planMerge(A, B, r.entries, actions, 'srt');
+  eq(p.blocked.length, 0, '混合批量无阻塞');
+  eq(p.cues.length, 4, '批量后 4 条（含 1→2）');
+  eq(p.cues[0].start, 1500, '第 1 条采用对照时间');
+  eq(p.cues[1].lines.join(), '新', '第 2 条采用对照文本');
+  eq(p.cues.map(c => c.start).join(','), '1500,3000,5000,6500', '批量结果时间有序');
+  eq(A.length, 3, 'planMerge 不修改输入数组长度');
+  // 无效操作在批量中进 blocked 而非抛错
+  const p2 = Core.planMerge(A, B, r.entries, {}, 'srt');
+  eq(p2.applied.length, 0, '无 actions 时不应用任何条目');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

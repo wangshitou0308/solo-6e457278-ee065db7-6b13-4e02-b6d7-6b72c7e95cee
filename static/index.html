@@ -17,6 +17,12 @@
   </div>
 
   <div class="group">
+    <button id="btnCompareLoad" class="accent" title="再载入一份 SRT / WebVTT 作为对照（仅在本地浏览器处理，不上传、不入库；刷新后需重新选择）">载入对照…</button>
+    <input type="file" id="compareInput" accept=".srt,.vtt,.txt" hidden>
+    <button id="btnCompareView" class="hidden" title="切换到版本对照合并台">对照合并</button>
+  </div>
+
+  <div class="group">
     <button id="btnUndo" title="撤销 (Ctrl+Z)" disabled>↶ 撤销</button>
     <button id="btnRedo" title="重做 (Ctrl+Y)" disabled>↷ 重做</button>
   </div>
@@ -102,7 +108,29 @@
 
 <main id="workspace">
   <section id="leftPane">
-    <div id="timelineWrap">
+  <div id="compareBar" class="hidden">
+    <span class="label">对照版：</span>
+    <span id="compareFileInfo" class="muted"></span>
+    <label title="只看差异类型">
+      筛选
+      <select id="cmpFilter">
+        <option value="all">全部</option>
+        <option value="diff" selected>有差异</option>
+        <option value="text">文字变化</option>
+        <option value="time">时间偏移</option>
+        <option value="struct">结构（一对多/多对一）</option>
+        <option value="only">仅一侧</option>
+        <option value="conflict">冲突</option>
+      </select>
+    </label>
+    <label class="chk" title="只显示置信度足够、非冲突的差异">
+      <input type="checkbox" id="cmpHighOnly"> 仅高置信
+    </label>
+    <span id="cmpStats" class="muted grow"></span>
+    <button id="btnBatchMerge" class="primary" title="按当前筛选，预填所有高置信度差异并生成合并预览">批量合并预览…</button>
+    <button id="btnCompareClose" title="关闭对照并保留当前工作字幕（对照文件只在内存中，刷新后需重新选择）">关闭对照</button>
+  </div>
+  <div id="timelineWrap">
       <canvas id="timeline"></canvas>
       <div id="timelineHint" class="muted">
         <span class="zoombtns">
@@ -123,6 +151,36 @@
       <div id="emptyState">
         <p>尚未载入字幕。</p>
         <p>点击 <b>导入字幕</b> 选择 .srt / .vtt 文件，或点击 <b>载入示例</b> 立即体验。</p>
+      </div>
+    </div>
+
+    <div id="compareView" class="hidden">
+      <div id="compareTlWrap">
+        <canvas id="compareTimeline"></canvas>
+        <div id="compareHint" class="muted">
+          <span class="cmp-legend">
+            <i class="lg lg-a"></i>当前版
+            <i class="lg lg-b"></i>对照版
+            <i class="lg lg-play"></i>播放头
+            <i class="lg lg-conf"></i>冲突
+          </span>
+          <span>点击条目 / 色块同步定位播放头与媒体；滚轮缩放、拖动空白平移。冲突项不自动选边，请手动处理。</span>
+        </div>
+      </div>
+      <div id="cmpListWrap">
+        <table id="cmpTable">
+          <thead>
+            <tr>
+              <th class="cmp-kind">类型</th>
+              <th class="cmp-time">当前版时间</th>
+              <th class="cmp-text">当前版文本</th>
+              <th class="cmp-time">对照版时间</th>
+              <th class="cmp-text">对照版文本</th>
+              <th class="cmp-ops">采用 / 处理</th>
+            </tr>
+          </thead>
+          <tbody id="cmpTbody"></tbody>
+        </table>
       </div>
     </div>
   </section>
@@ -213,6 +271,28 @@
     <div class="row-end">
       <button id="btnAnchorClose">关闭</button>
       <button id="btnAnchorApply" class="primary" disabled>应用校时</button>
+    </div>
+  </div>
+</div>
+
+<div id="mergeModal" class="hidden">
+  <div id="mergeBox">
+    <h3>批量合并预览</h3>
+    <p class="muted" id="mergeSummary"></p>
+    <div id="mergeTableWrap">
+      <table id="mergeTable">
+        <thead>
+          <tr><th>采用</th><th>类型</th><th>当前版</th><th>对照版 / 结果</th><th>状态</th></tr>
+        </thead>
+        <tbody id="mergeTbody"></tbody>
+      </table>
+    </div>
+    <p class="muted" id="mergeNote">
+      冲突项不会进入批量合并，留待手动处理；合并不破坏时间顺序、不产生无效时长，并保留 WebVTT cue 标识与设置。
+    </p>
+    <div class="row-end">
+      <button id="btnMergeCancel">取消</button>
+      <button id="btnMergeApply" class="primary">应用合并</button>
     </div>
   </div>
 </div>

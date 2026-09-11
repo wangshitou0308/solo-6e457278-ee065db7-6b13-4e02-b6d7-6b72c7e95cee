@@ -43,6 +43,18 @@
   var anchorDiffTbody = $('anchorDiffTbody');
   var btnAnchorClose = $('btnAnchorClose'), btnAnchorApply = $('btnAnchorApply');
   var btnClearA1 = $('btnClearA1'), btnClearA2 = $('btnClearA2');
+  // 版本对照
+  var btnCompareLoad = $('btnCompareLoad'), compareInput = $('compareInput');
+  var btnCompareView = $('btnCompareView'), btnCompareClose = $('btnCompareClose');
+  var compareBar = $('compareBar'), compareView = $('compareView');
+  var compareFileInfo = $('compareFileInfo'), cmpStats = $('cmpStats');
+  var cmpFilter = $('cmpFilter'), cmpHighOnly = $('cmpHighOnly');
+  var btnBatchMerge = $('btnBatchMerge');
+  var cmpTbody = $('cmpTbody');
+  var cmpCanvas = $('compareTimeline'), cmpCtx = cmpCanvas.getContext('2d');
+  var mergeModal = $('mergeModal'), mergeSummary = $('mergeSummary'), mergeTbody = $('mergeTbody');
+  var btnMergeCancel = $('btnMergeCancel'), btnMergeApply = $('btnMergeApply');
+  var timelineWrapEl = $('timelineWrap'), cueListWrapEl = $('cueListWrap');
   var anchorCells = {
     a1: { cue: $('a1Cue'), src: $('a1Src'), dst: $('a1Dst') },
     a2: { cue: $('a2Cue'), src: $('a2Src'), dst: $('a2Dst') },
@@ -85,6 +97,15 @@
     anchors: { a1: null, a2: null },   // {cue, num, srcTime, dstTime}
     pendingSync: null,                  // 双锚点预览结果
     pendingRewrap: null,                // 批量分行预览计划
+    // 版本对照（对照文件仅留在浏览器内存，刷新后需重新选择）
+    refDoc: null, refName: null,        // {format, header, cues}
+    refResult: null,                    // alignDocuments 结果 {entries, stats}
+    compareOn: false,                   // 是否显示对照视图
+    cmpView: { startMs: 0, pxPerMs: 0.1 },
+    cmpFilter: 'diff', cmpHighOnly: false,
+    cmpSelected: -1,                    // 当前选中的对照条目
+    adopted: {},                        // 已逐项采用的条目：entryIdx → 模式
+    pendingMerge: null,                 // 批量合并预览
   };
   var rowEls = [];        // 每行 DOM 缓存
   var activeRowIdx = -1;  // 播放头当前所在字幕行
@@ -144,6 +165,7 @@
     lastUndoLabel = '';
     renderList();
     afterChange('已撤销');
+    syncCompareAfterEdit();
   }
   function doRedo() {
     if (!state.doc || !state.redoStack.length) return;
@@ -152,6 +174,7 @@
     lastUndoLabel = '';
     renderList();
     afterChange('已重做');
+    syncCompareAfterEdit();
   }
   function updateUndoButtons() {
     btnUndo.disabled = !state.undoStack.length;
@@ -195,6 +218,7 @@
     state.loop.on = false;
     loopCueChk.checked = false;
     lastUndoLabel = '';
+    resetCompare(true);
     hideDraftBanner();
     fitAll();
     renderList();
@@ -998,6 +1022,7 @@
       mediaClock.textContent = C.fmtShort(state.playheadMs) + ' / ' + C.fmtShort(state.media.duration);
     }
     updateNowCue();
+    if (state.compareOn) drawCompareCanvas();
   }
   // 当前字幕预览（媒体条 + 视频叠加层）
   var lastNowCue = null;
@@ -1345,6 +1370,10 @@
       if (e.key === 'Escape') hideRewrap();
       return;
     }
+    if (!mergeModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') hideMergeModal();
+      return;
+    }
     var step = e.shiftKey ? 500 : (e.altKey ? 10 : 100);
     switch (e.key) {
       case ' ':
@@ -1640,6 +1669,834 @@
   btnUndo.addEventListener('click', doUndo);
   btnRedo.addEventListener('click', doRedo);
 
+  // ============================================================
+  // 版本对照合并（对照文件只在浏览器内存，不上传、不入库、刷新重选）
+  // ============================================================
+
+  var cmpRowEls = [];
+  var cmpCssW = 0, cmpCssH = 0;
+
+  function resetCompare(silent) {
+    state.refDoc = null;
+    state.refName = null;
+    state.refResult = null;
+    state.adopted = {};
+    state.cmpSelected = -1;
+    state.pendingMerge = null;
+    state.compareOn = false;
+    cmpRowEls = [];
+    compareInput.value = '';
+    btnCompareView.classList.add('hidden');
+    btnCompareView.textContent = '对照合并';
+    hideCompareView();
+    mergeModal.classList.add('hidden');
+    if (!silent) setStatus('已关闭对照：对照文件只在内存中，刷新后需重新选择');
+  }
+
+  // ---------- 载入对照文件 ----------
+  btnCompareLoad.addEventListener('click', function () {
+    if (!state.doc) { setStatus('请先载入或导入当前工作字幕，再选择对照文件'); return; }
+    compareInput.click();
+  });
+  compareInput.addEventListener('change', function () {
+    var f = compareInput.files && compareInput.files[0];
+    compareInput.value = '';
+    if (!f) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var doc;
+      try {
+        doc = C.parseSubtitle(String(reader.result || ''));
+      } catch (e) {
+        setStatus('对照文件解析失败：' + e.message);
+        return;
+      }
+      if (!doc.cues.length) {
+        setStatus('未能从对照文件 ' + f.name + ' 解析到任何字幕条目');
+        return;
+      }
+      state.refDoc = doc;
+      state.refName = f.name;
+      state.adopted = {};
+      state.cmpSelected = -1;
+      runAlign();
+      compareFileInfo.textContent = f.name + ' · ' + doc.format.toUpperCase() + ' · ' + doc.cues.length + ' 条';
+      btnCompareView.classList.remove('hidden');
+      showCompareView();
+      fitCompareAll();
+      setStatus('已载入对照《' + f.name + '》（' + doc.cues.length + ' 条，' + doc.format.toUpperCase() +
+        '），仅在本地浏览器处理，不上传、不入库');
+    };
+    reader.onerror = function () { setStatus('读取对照文件失败'); };
+    reader.readAsText(f, 'utf-8');
+  });
+
+  btnCompareView.addEventListener('click', function () {
+    if (state.compareOn) hideCompareView(); else showCompareView();
+  });
+  btnCompareClose.addEventListener('click', function () {
+    state.refDoc = null;
+    state.refName = null;
+    state.refResult = null;
+    state.adopted = {};
+    state.cmpSelected = -1;
+    btnCompareView.classList.add('hidden');
+    hideCompareView();
+    setStatus('已关闭对照；当前工作字幕的修改保留。对照文件刷新后需重新选择');
+  });
+
+  function showCompareView() {
+    if (!state.refDoc) return;
+    state.compareOn = true;
+    compareBar.classList.remove('hidden');
+    compareView.classList.remove('hidden');
+    timelineWrapEl.classList.add('hidden');
+    cueListWrapEl.classList.add('hidden');
+    btnCompareView.textContent = '返回校准台';
+    renderCompare();
+    resizeCompareCanvas();
+  }
+  function hideCompareView() {
+    state.compareOn = false;
+    compareBar.classList.add('hidden');
+    compareView.classList.add('hidden');
+    timelineWrapEl.classList.remove('hidden');
+    cueListWrapEl.classList.remove('hidden');
+    btnCompareView.textContent = '对照合并';
+    resizeCanvas();
+    drawCanvas();
+  }
+
+  // ---------- 对齐 ----------
+  function runAlign() {
+    if (!state.doc || !state.refDoc) { state.refResult = null; return; }
+    state.refResult = C.alignDocuments(state.doc.cues, state.refDoc.cues);
+  }
+
+  function cmpFilterVal() { return cmpFilter.value || 'all'; }
+  cmpFilter.addEventListener('change', function () {
+    state.cmpFilter = cmpFilter.value;
+    renderCompare();
+  });
+  cmpHighOnly.addEventListener('change', function () {
+    state.cmpHighOnly = cmpHighOnly.checked;
+    renderCompare();
+  });
+
+  function entryFiltered(e) {
+    var f = cmpFilterVal();
+    var high = state.cmpHighOnly;
+    if (high && e.kind === 'pair' && e.conflict) return true;
+    if (high && e.kind !== 'pair') return true;
+    if (f === 'all') return false;
+    if (f === 'diff') {
+      if (e.kind === 'pair') return !(e.textChanged || e.timeChanged || e.alen !== 1 || e.blen !== 1);
+      return false;
+    }
+    if (f === 'conflict') return !(e.kind === 'pair' && e.conflict);
+    if (f === 'text') return !(e.kind === 'pair' && e.textChanged);
+    if (f === 'time') return !(e.kind === 'pair' && e.timeChanged);
+    if (f === 'struct') return !(e.kind === 'pair' && (e.alen !== 1 || e.blen !== 1));
+    if (f === 'only') return e.kind === 'pair';
+    return false;
+  }
+
+  function entryTypeLabel(e) {
+    if (e.kind === 'only-a') return { cls: 'kb-only-a', text: '仅当前版' };
+    if (e.kind === 'only-b') return { cls: 'kb-only-b', text: '仅对照版' };
+    if (e.conflict) return { cls: 'kb-conflict', text: '冲突' };
+    if (e.alen !== 1 || e.blen !== 1) return { cls: 'kb-struct', text: e.alen + '↔' + e.blen + ' 结构' };
+    if (e.textChanged && e.timeChanged) return { cls: 'kb-both', text: '文字+时间' };
+    if (e.textChanged) return { cls: 'kb-text', text: '文字变化' };
+    if (e.timeChanged) return { cls: 'kb-time', text: '时间偏移' };
+    return { cls: 'kb-same', text: '一致' };
+  }
+
+  function fmtShift(d) {
+    var sign = d > 0 ? '+' : (d < 0 ? '−' : '±');
+    return sign + Math.abs(d) + 'ms';
+  }
+
+  // 字符级差异并排渲染（del 仅左、ins 仅右）
+  function diffHtml(segs, side) {
+    var out = '';
+    segs.forEach(function (g) {
+      if (g.t === 'eq') out += esc(g.s);
+      else if (g.t === 'del' && side === 'a') out += '<span class="del">' + esc(g.s) + '</span>';
+      else if (g.t === 'ins' && side === 'b') out += '<span class="ins">' + esc(g.s) + '</span>';
+    });
+    return out;
+  }
+
+  function refCueLines(bj) { return state.refDoc.cues[bj].lines.join('\n'); }
+  function curCueLines(ai) { return state.doc.cues[ai].lines.join('\n'); }
+
+  // ---------- 对照条目列表 ----------
+  function renderCompare() {
+    cmpRowEls = [];
+    cmpTbody.innerHTML = '';
+    var res = state.refResult;
+    if (!res) { cmpStats.textContent = ''; return; }
+    var shown = 0;
+    var frag = document.createDocumentFragment();
+    res.entries.forEach(function (e, idx) {
+      if (entryFiltered(e)) return;
+      shown++;
+      var tr = document.createElement('tr');
+      tr.dataset.idx = idx;
+      var rowCls = '';
+      if (e.conflict) rowCls += ' row-conflict';
+      if (e.kind === 'only-a') rowCls += ' row-only-a';
+      if (e.kind === 'only-b') rowCls += ' row-only-b';
+      if (state.adopted[idx]) rowCls += ' row-adopted';
+      if (idx === state.cmpSelected) rowCls += ' selected';
+      tr.className = rowCls.trim();
+      tr.innerHTML = renderEntryRow(e, idx);
+      frag.appendChild(tr);
+      cmpRowEls.push({ idx: idx, el: tr });
+    });
+    cmpTbody.appendChild(frag);
+    updateCmpStats(res, shown);
+  }
+
+  function updateCmpStats(res, shown) {
+    var s = res.stats;
+    cmpStats.textContent = '当前版 ' + state.doc.cues.length + ' 条 · 对照版 ' +
+      state.refDoc.cues.length + ' 条 · 配对 ' + s.pairs +
+      '（仅当前 ' + s.onlyA + ' / 仅对照 ' + s.onlyB + '）· 冲突 ' + s.conflicts +
+      ' · 已逐项采用 ' + Object.keys(state.adopted).length + ' · 显示 ' + shown + ' 项';
+  }
+
+  function renderEntryRow(e, idx) {
+    var badge = entryTypeLabel(e);
+    var kindCell = '<span class="cmp-kind-badge ' + badge.cls + '">' + badge.text + '</span>';
+    if (e.kind === 'pair' && e.conflict && e.reasons.length) {
+      kindCell += '<span class="cmp-conf-note">' + e.reasons.map(esc).join('<br>') + '</span>';
+    }
+    if (state.adopted[idx]) {
+      kindCell += '<span class="cmp-conf-note" style="color:var(--good)">已采用：' +
+        ({ text: '文本', time: '时间', full: '整条', group: '整组' }[state.adopted[idx]] || state.adopted[idx]) + '</span>';
+    }
+    var aTime = '', bTime = '', aText = '', bText = '';
+    if (e.kind === 'pair') {
+      var ga = spanOf(state.doc.cues, e.ai, e.alen);
+      var gb = spanOf(state.refDoc.cues, e.bj, e.blen);
+      aTime = groupTimeHtml(state.doc.cues, e.ai, e.alen);
+      bTime = groupTimeHtml(state.refDoc.cues, e.bj, e.blen);
+      if (e.alen === 1 && e.blen === 1 && e.textChanged) {
+        var segs = C.diffSegments(e.aRaw, e.bRaw);
+        aText = '<div class="cmp-cell cmp-side-a">' + diffHtml(segs, 'a') + '</div>';
+        bText = '<div class="cmp-cell cmp-side-b">' + diffHtml(segs, 'b') + '</div>';
+      } else if (e.alen === 1 && e.blen === 1 && !e.textChanged) {
+        aText = '<div class="cmp-cell cmp-side-a">' + esc(e.aRaw) + '</div>';
+        bText = '<div class="cmp-cell cmp-side-b">' + esc(e.bRaw) + '</div>';
+      } else {
+        aText = '<div class="cmp-cell cmp-side-a">' + esc(e.aRaw) + '</div>';
+        bText = '<div class="cmp-cell cmp-side-b">' + esc(e.bRaw) + '</div>';
+      }
+      if (e.alen === 1 && e.blen === 1 && e.timeChanged) {
+        bTime += '<span class="dt shift">Δ起 ' + fmtShift(e.dStart) + ' Δ止 ' + fmtShift(e.dEnd) + '</span>';
+      }
+    } else if (e.kind === 'only-a') {
+      aTime = groupTimeHtml(state.doc.cues, e.ai, 1);
+      aText = '<div class="cmp-cell cmp-side-a">' + esc(curCueLines(e.ai)) + '</div>';
+      bText = '<div class="cmp-cell empty cmp-side-b">（对照版无对应条目）</div>';
+    } else {
+      bTime = groupTimeHtml(state.refDoc.cues, e.bj, 1);
+      aText = '<div class="cmp-cell empty cmp-side-a">（当前版无对应条目）</div>';
+      bText = '<div class="cmp-cell cmp-side-b">' + esc(refCueLines(e.bj)) + '</div>';
+    }
+    return '<td class="cmp-kind">' + kindCell + '</td>' +
+      '<td class="cmp-time">' + aTime + '</td>' +
+      '<td class="cmp-text">' + aText + '</td>' +
+      '<td class="cmp-time">' + bTime + '</td>' +
+      '<td class="cmp-text">' + bText + '</td>' +
+      '<td class="cmp-ops">' + entryOpsHtml(e, idx) + '</td>';
+  }
+
+  function spanOf(cues, start, len) {
+    var s = cues[start].start, en = cues[start].end;
+    for (var k = 1; k < len; k++) {
+      s = Math.min(s, cues[start + k].start);
+      en = Math.max(en, cues[start + k].end);
+    }
+    return { start: s, end: en };
+  }
+  function groupTimeHtml(cues, start, len) {
+    var out = '';
+    for (var k = 0; k < len; k++) {
+      var c = cues[start + k];
+      out += '<div>' + C.fmtMs(c.start, 'srt') + '<br>→ ' + C.fmtMs(c.end, 'srt') + '</div>';
+    }
+    return out;
+  }
+
+  function entryOpsHtml(e, idx) {
+    var h = '';
+    var errs = C.entryActionErrors(state.doc.cues, state.refDoc.cues, e);
+    function btn(mode, cls, label, title, disabled, reason) {
+      h += '<button class="' + cls + '" data-mode="' + mode + '"' +
+        (disabled ? ' disabled title="' + esc(reason || '当前不可用') + '"' : ' title="' + esc(title) + '"') +
+        '>' + label + '</button>';
+    }
+    if (e.kind === 'pair') {
+      var structural = e.alen !== 1 || e.blen !== 1;
+      if (structural) {
+        btn('group', 'op-group', '整组采用', '用对照版的 ' + e.blen + ' 条整体替换当前版的 ' + e.alen +
+          ' 条（保留标识 / 设置，校验时间顺序）', !!errs.group, errs.group);
+      } else {
+        btn('text', 'op-text', '采用文本', '只采用对照文本（时间与标识不变）', !!errs.text, errs.text);
+        btn('time', 'op-time', '采用时间', '只采用对照时间（文本与标识不变）', !!errs.time, errs.time);
+        btn('full', 'op-full', '整条采用', '文本 + 时间均采用对照版（保留 WebVTT 标识 / 设置）',
+          !!errs.full, errs.full);
+      }
+    } else if (e.kind === 'only-b') {
+      btn('insert', 'op-insert', '插入', '把这条对照字幕插入当前时间轴（需落在相邻条目间隙）',
+        !!errs.insert, errs.insert);
+    } else {
+      btn('delete', 'op-del', '删除', '从当前工作字幕删除该条', false);
+    }
+    return h;
+  }
+
+  // 点击条目：定位播放头；点操作按钮：采用
+  cmpTbody.addEventListener('click', function (ev) {
+    var tr = ev.target.closest('tr');
+    if (!tr) return;
+    var idx = +tr.dataset.idx;
+    var btnEl = ev.target.closest('button[data-mode]');
+    if (btnEl) {
+      ev.stopPropagation();
+      if (!btnEl.disabled) applyEntry(idx, btnEl.dataset.mode);
+      return;
+    }
+    selectEntry(idx, { seek: true, scrollMain: true });
+  });
+
+  function entrySeekTime(e) {
+    if (e.kind === 'only-b') return state.refDoc.cues[e.bj].start;
+    return state.doc.cues[e.ai].start;
+  }
+
+  function selectEntry(idx, opts) {
+    opts = opts || {};
+    state.cmpSelected = idx;
+    cmpRowEls.forEach(function (r) { r.el.classList.toggle('selected', r.idx === idx); });
+    var e = state.refResult.entries[idx];
+    if (opts.seek) {
+      var t = entrySeekTime(e);
+      setPlayhead(t);
+      // 同步主时间轴选中（仅当前版条目可选中）
+      if (e.kind !== 'only-b') {
+        selectCue(e.ai, { center: false, scroll: false });
+      }
+    }
+    if (opts.scrollMain && state.doc && e.kind !== 'only-b' && rowEls[e.ai]) {
+      rowEls[e.ai].scrollIntoView({ block: 'nearest' });
+    }
+    drawCompareCanvas();
+  }
+
+  // ---------- 逐项采用 ----------
+  function applyEntry(idx, mode) {
+    if (!state.doc || !state.refDoc) return;
+    var e = state.refResult.entries[idx];
+    var res;
+    commitAllRows();
+    var cues = state.doc.cues, ref = state.refDoc.cues;
+    if (mode === 'text') res = C.adoptText(cues, e.ai, ref[e.bj].lines);
+    else if (mode === 'time') res = C.adoptTime(cues, e.ai, ref[e.bj].start, ref[e.bj].end);
+    else if (mode === 'full') res = C.adoptFull(cues, e.ai, ref[e.bj], state.doc.format);
+    else if (mode === 'group') res = C.replaceGroup(cues, e.ai, e.alen, ref, e.bj, e.blen, state.doc.format);
+    else if (mode === 'insert') res = C.insertOnlyB(cues, e.aBefore, ref[e.bj], state.doc.format);
+    else if (mode === 'delete') res = C.deleteOnlyA(cues, e.ai, state.doc.format);
+    if (!res || res.error) {
+      setStatus('无法采用：' + (res && res.error ? res.error : '未知操作'));
+      return;
+    }
+    pushUndo('compare');
+    state.doc.cues = res.cues;
+    state.anchors.a1 = null; state.anchors.a2 = null;
+    updateAnchorButtons();
+    renderList();
+    afterChange(null);
+    // 结构变化后重新对齐，把本次采用标到新对齐结果的对应条目上
+    var prevEntry = e, prevMode = mode;
+    runAlign();
+    state.adopted = recomputeAdopted();
+    selectEntryAfterAdoption(prevEntry);   // 内部 renderCompare
+    drawCompareCanvas();
+    var label = { text: '文本', time: '时间', full: '整条', group: '整组', insert: '插入对照条', delete: '删除仅当前条' }[mode];
+    setStatus('已采用对照版' + label + '（撤销可回退，节奏检查 / 草稿 / 导出已同步）');
+  }
+
+  // 单项采用后：在新对齐结果中选中对应对照条目
+  function selectEntryAfterAdoption(prevEntry) {
+    var entries = state.refResult.entries;
+    state.cmpSelected = -1;
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i];
+      if (prevEntry.kind === 'pair' && e.kind === 'pair' && e.bj === prevEntry.bj) {
+        state.cmpSelected = i;
+        break;
+      }
+    }
+    renderCompare();
+  }
+
+  // ---------- 批量合并预览 ----------
+  function defaultActions() {
+    var actions = {};
+    var res = state.refResult;
+    res.entries.forEach(function (e, i) {
+      if (entryFiltered(e)) return;
+      if (e.kind === 'pair') {
+        if (e.conflict) return;                      // 冲突留待手动
+        if (!(e.textChanged || e.timeChanged || e.alen !== 1 || e.blen !== 1)) return;
+        var done = state.adopted[i];
+        if (e.alen !== 1 || e.blen !== 1) {
+          // 结构组：已整组采用则跳过
+          if (done === 'group') return;
+          actions[i] = 'group';
+        } else if (done === 'full') {
+          return;                                   // 整条已采用
+        } else if (done === 'text') {
+          if (e.timeChanged) actions[i] = 'time';   // 仅文本已采用 → 批量补时间
+        } else if (done === 'time') {
+          if (e.textChanged) actions[i] = 'text';   // 仅时间已采用 → 批量补文本
+        } else {
+          actions[i] = 'full';
+        }
+      } else if (e.kind === 'only-b') {
+        if (state.adopted[i] === 'insert') return;
+        actions[i] = 'insert';
+      } else if (e.kind === 'only-a') {
+        actions[i] = 'delete';
+      }
+    });
+    return actions;
+  }
+
+  btnBatchMerge.addEventListener('click', function () {
+    if (!state.refResult) return;
+    commitAllRows();
+    var actions = defaultActions();
+    var plan = C.planMerge(state.doc.cues, state.refDoc.cues,
+      state.refResult.entries, actions, state.doc.format);
+    state.pendingMerge = { actions: actions, plan: plan };
+    renderMergeModal();
+    mergeModal.classList.remove('hidden');
+  });
+
+  var MODE_LABEL = { text: '采用文本', time: '采用时间', full: '整条采用', group: '整组采用', insert: '插入', delete: '删除' };
+
+  function renderMergeModal() {
+    var pend = state.pendingMerge;
+    var plan = pend.plan, actions = pend.actions;
+    mergeTbody.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    var blockedByIdx = {};
+    plan.blocked.forEach(function (b) { blockedByIdx[b.idx] = b; });
+    var appliedByIdx = {};
+    plan.applied.forEach(function (a) { appliedByIdx[a.idx] = a.mode; });
+    plan.applied.forEach(function (a) {
+      var e = state.refResult.entries[a.idx];
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td><label><input type="checkbox" data-idx="' + a.idx + '" checked> ' +
+        '<span class="mr-mode">' + MODE_LABEL[a.mode] + '</span></label></td>' +
+        '<td>' + esc(entryTypeLabel(e).text) + '</td>' +
+        '<td class="mr-old">' + esc(entrySideText(e, 'a')) + '</td>' +
+        '<td class="mr-new">' + esc(entrySideText(e, 'b')) + '</td>' +
+        '<td class="muted">将应用</td>';
+      frag.appendChild(tr);
+    });
+    plan.blocked.forEach(function (b) {
+      var e = state.refResult.entries[b.idx];
+      var tr = document.createElement('tr');
+      tr.className = 'mr-blocked';
+      tr.innerHTML =
+        '<td><label><input type="checkbox" data-idx="' + b.idx + '"> ' +
+        '<span class="mr-mode">' + (MODE_LABEL[b.mode] || b.mode) + '</span></label></td>' +
+        '<td>' + esc(entryTypeLabel(e).text) + '</td>' +
+        '<td class="mr-old">' + esc(entrySideText(e, 'a')) + '</td>' +
+        '<td class="mr-new">' + esc(entrySideText(e, 'b')) + '</td>' +
+        '<td class="mr-reason">跳过：' + esc(b.reason) + '</td>';
+      frag.appendChild(tr);
+    });
+    mergeTbody.appendChild(frag);
+    mergeSummary.textContent = '将应用 ' + plan.applied.length + ' 项，跳过 ' + plan.blocked.length +
+      ' 项（冲突项不在批量范围内，需手动处理）。可勾选调整；跳过节拍后后续条目仍按各自校验执行。';
+    btnMergeApply.disabled = plan.applied.length === 0;
+  }
+
+  function entrySideText(e, side) {
+    if (side === 'a') {
+      if (e.kind === 'only-b') return '（无）';
+      if (e.kind === 'only-a') return curCueLines(e.ai);
+      return e.aRaw;
+    }
+    if (e.kind === 'only-a') return '（删除）';
+    if (e.kind === 'only-b') return refCueLines(e.bj);
+    return e.bRaw;
+  }
+
+  // 复选框切换：从计划中增减，重新用 planMerge 模拟
+  mergeTbody.addEventListener('change', function (ev) {
+    var cb = ev.target.closest('input[type="checkbox"][data-idx]');
+    if (!cb) return;
+    var pend = state.pendingMerge;
+    var idx = +cb.dataset.idx;
+    var baseMode = null;
+    pend.plan.applied.forEach(function (a) { if (a.idx === idx) baseMode = a.mode; });
+    pend.plan.blocked.forEach(function (b) { if (b.idx === idx) baseMode = b.mode; });
+    if (cb.checked) pend.actions[idx] = baseMode;
+    else delete pend.actions[idx];
+    pend.plan = C.planMerge(state.doc.cues, state.refDoc.cues,
+      state.refResult.entries, pend.actions, state.doc.format);
+    renderMergeModal();
+  });
+
+  function hideMergeModal() {
+    mergeModal.classList.add('hidden');
+    state.pendingMerge = null;
+  }
+  btnMergeCancel.addEventListener('click', hideMergeModal);
+  mergeModal.addEventListener('click', function (ev) { if (ev.target === mergeModal) hideMergeModal(); });
+  btnMergeApply.addEventListener('click', function () {
+    var pend = state.pendingMerge;
+    if (!pend || !state.doc) { hideMergeModal(); return; }
+    var plan = pend.plan;
+    if (!plan.applied.length) { hideMergeModal(); return; }
+    commitAllRows();
+    pushUndo('comparebatch');
+    state.doc.cues = plan.cues;
+    state.anchors.a1 = null; state.anchors.a2 = null;
+    updateAnchorButtons();
+    hideMergeModal();
+    renderList();
+    afterChange(null);
+    runAlign();
+    state.adopted = recomputeAdopted();
+    renderCompare();
+    drawCompareCanvas();
+    setStatus(plan.blocked.length
+      ? '批量合并应用 ' + plan.applied.length + ' 项；' + plan.blocked.length +
+        ' 项因时间冲突被跳过，冲突项请手动处理（撤销可整体回退）'
+      : '已批量合并 ' + plan.applied.length + ' 项（冲突未自动处理；时间顺序与 cue 标识已校验，撤销可回退）');
+  });
+
+  // ---------- 双层时间轴 ----------
+  function cmpTimeToX(t) { return (t - state.cmpView.startMs) * state.cmpView.pxPerMs; }
+  function cmpXToTime(x) { return state.cmpView.startMs + x / state.cmpView.pxPerMs; }
+  function cmpDocEnd() {
+    var e = docEnd();
+    if (state.refDoc) state.refDoc.cues.forEach(function (c) { if (c.end > e) e = c.end; });
+    return e;
+  }
+  function fitCompareAll() {
+    var end = cmpDocEnd();
+    var w = cmpCanvas.clientWidth || 800;
+    var pad = Math.max(end * 0.04, 500);
+    var span = end + pad * 2 || 10000;
+    state.cmpView.pxPerMs = clamp(w / span, MIN_PX, MAX_PX);
+    state.cmpView.startMs = -pad;
+    drawCompareCanvas();
+  }
+  function resizeCompareCanvas() {
+    var dpr = window.devicePixelRatio || 1;
+    cmpCssW = cmpCanvas.clientWidth; cmpCssH = cmpCanvas.clientHeight;
+    cmpCanvas.width = Math.round(cmpCssW * dpr);
+    cmpCanvas.height = Math.round(cmpCssH * dpr);
+    cmpCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawCompareCanvas();
+  }
+
+  var CMP_RULER_H = 22;
+  function drawCompareCanvas() {
+    if (!cmpCssW || !state.refDoc || !state.refResult || !state.doc) return;
+    // 对齐结果可能引用了切换文档前的旧索引：整体越界时不绘制（载入新文档会重算）
+    var stale = state.refResult.entries.some(function (e) {
+      if (e.kind === 'pair') return e.ai + e.alen > state.doc.cues.length ||
+        e.bj + e.blen > state.refDoc.cues.length;
+      if (e.kind === 'only-a') return e.ai >= state.doc.cues.length;
+      return e.bj >= state.refDoc.cues.length;
+    });
+    if (stale) return;
+    cmpCtx.clearRect(0, 0, cmpCssW, cmpCssH);
+    // 背景与轨道
+    cmpCtx.fillStyle = '#161d2e';
+    cmpCtx.fillRect(0, 0, cmpCssW, CMP_RULER_H);
+    var trackH = (cmpCssH - CMP_RULER_H - 8) / 2;
+    var ay = CMP_RULER_H + 4, by = ay + trackH + 4;
+    cmpCtx.fillStyle = '#111a2b';
+    cmpCtx.fillRect(0, ay, cmpCssW, trackH);
+    cmpCtx.fillRect(0, by, cmpCssW, trackH);
+    cmpCtx.fillStyle = '#8595b6';
+    cmpCtx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+    cmpCtx.textBaseline = 'top';
+    cmpCtx.fillText('当前', 6, ay + 3);
+    cmpCtx.fillStyle = '#7fd6b0';
+    cmpCtx.fillText('对照', 6, by + 3);
+    drawCmpRuler();
+    var res = state.refResult;
+    // 配对连线（细）
+    cmpCtx.lineWidth = 1;
+    res.entries.forEach(function (e) {
+      if (e.kind !== 'pair') return;
+      var ga = spanOf(state.doc.cues, e.ai, e.alen);
+      var gb = spanOf(state.refDoc.cues, e.bj, e.blen);
+      var x1 = cmpTimeToX((ga.start + ga.end) / 2);
+      var x2 = cmpTimeToX((gb.start + gb.end) / 2);
+      cmpCtx.strokeStyle = e.conflict ? 'rgba(248,113,113,0.55)' : 'rgba(133,149,182,0.35)';
+      cmpCtx.beginPath();
+      cmpCtx.moveTo(x1, ay + trackH - 1);
+      cmpCtx.lineTo(x2, by + 1);
+      cmpCtx.stroke();
+    });
+    // 当前轨色块
+    state.doc.cues.forEach(function (c, i) {
+      drawCmpBlock(c, ay, trackH, '#2a3d66', '#4a5b85', i === state.selected);
+    });
+    // 对照轨色块（冲突对红框）
+    var conflictB = {};
+    res.entries.forEach(function (e) {
+      if (e.kind === 'pair' && e.conflict) {
+        for (var k = 0; k < e.blen; k++) conflictB[e.bj + k] = true;
+      }
+    });
+    state.refDoc.cues.forEach(function (c, i) {
+      drawCmpBlock(c, by, trackH, conflictB[i] ? '#5c2a2a' : '#1f5240',
+        conflictB[i] ? '#f87171' : '#3a8f6f', false);
+    });
+    // 播放头（贯通双层）
+    var px = cmpTimeToX(state.playheadMs);
+    if (px >= -10 && px <= cmpCssW + 10) {
+      cmpCtx.strokeStyle = '#f87171';
+      cmpCtx.lineWidth = 1.5;
+      cmpCtx.beginPath();
+      cmpCtx.moveTo(px, 0);
+      cmpCtx.lineTo(px, cmpCssH);
+      cmpCtx.stroke();
+    }
+  }
+
+  function drawCmpRuler() {
+    var step = pickCmpStep();
+    var start = state.cmpView.startMs, end = cmpXToTime(cmpCssW);
+    cmpCtx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+    cmpCtx.textBaseline = 'top';
+    for (var t = Math.ceil(start / step) * step; t <= end; t += step) {
+      var x = Math.round(cmpTimeToX(t)) + 0.5;
+      cmpCtx.strokeStyle = '#3a4a6e';
+      cmpCtx.beginPath();
+      cmpCtx.moveTo(x, CMP_RULER_H - 7);
+      cmpCtx.lineTo(x, CMP_RULER_H);
+      cmpCtx.stroke();
+      cmpCtx.fillStyle = '#8595b6';
+      cmpCtx.fillText(C.fmtShort(t), x + 3, 4);
+    }
+  }
+  function pickCmpStep() {
+    for (var i = 0; i < TICK_STEPS.length; i++) {
+      if (TICK_STEPS[i] * state.cmpView.pxPerMs >= 80) return TICK_STEPS[i];
+    }
+    return TICK_STEPS[TICK_STEPS.length - 1];
+  }
+
+  function drawCmpBlock(c, y, h, fill, stroke, selected) {
+    var x1 = cmpTimeToX(c.start), x2 = cmpTimeToX(c.end);
+    if (x2 < -20 || x1 > cmpCssW + 20) return;
+    if (x2 - x1 < 2) x2 = x1 + 2;
+    cmpCtx.fillStyle = fill;
+    roundRectCtx(cmpCtx, x1, y + 2, x2 - x1, h - 4, 3);
+    cmpCtx.fill();
+    cmpCtx.lineWidth = selected ? 2 : 1;
+    cmpCtx.strokeStyle = selected ? '#9fc0ff' : stroke;
+    roundRectCtx(cmpCtx, x1 + 0.5, y + 2.5, x2 - x1 - 1, h - 5, 3);
+    cmpCtx.stroke();
+    cmpCtx.save();
+    cmpCtx.beginPath();
+    cmpCtx.rect(x1 + 3, y, Math.max(0, x2 - x1 - 6), h);
+    cmpCtx.clip();
+    cmpCtx.fillStyle = '#c4d2ee';
+    cmpCtx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+    cmpCtx.textBaseline = 'middle';
+    cmpCtx.fillText('#' + c.num + ' ' + c.lines.join(' '), x1 + 4, y + h / 2 + 1);
+    cmpCtx.restore();
+  }
+  function roundRectCtx(ctx2, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx2.beginPath();
+    ctx2.moveTo(x + r, y);
+    ctx2.arcTo(x + w, y, x + w, y + h, r);
+    ctx2.arcTo(x + w, y + h, x, y + h, r);
+    ctx2.arcTo(x, y + h, x, y, r);
+    ctx2.arcTo(x, y, x + w, y, r);
+    ctx2.closePath();
+  }
+
+  // 双层时间轴交互：点色块定位，点空白平移，滚轮缩放
+  var cmpDrag = null;
+  function cmpHitTest(x, y) {
+    var trackH = (cmpCssH - CMP_RULER_H - 8) / 2;
+    var ay = CMP_RULER_H + 4, by = ay + trackH + 4;
+    var t = cmpXToTime(x);
+    function hit(cues) {
+      for (var i = 0; i < cues.length; i++) {
+        var x1 = cmpTimeToX(cues[i].start), x2 = cmpTimeToX(cues[i].end);
+        if (x >= x1 - 2 && x <= x2 + 2) return i;
+      }
+      return -1;
+    }
+    if (y >= ay && y <= ay + trackH) return { track: 'a', i: hit(state.doc.cues) };
+    if (y >= by && y <= by + trackH) return { track: 'b', i: hit(state.refDoc.cues) };
+    return null;
+  }
+  cmpCanvas.addEventListener('mousedown', function (ev) {
+    if (ev.button !== 0 || !state.refResult) return;
+    var rect = cmpCanvas.getBoundingClientRect();
+    var x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+    if (y < CMP_RULER_H) {
+      cmpDrag = { mode: 'scrub', startX: x };
+      setPlayhead(cmpXToTime(x));
+      drawCompareCanvas();
+      return;
+    }
+    var h = cmpHitTest(x, y);
+    if (h && h.i >= 0) {
+      cmpDrag = { mode: 'hit', hit: h };
+    } else {
+      cmpDrag = { mode: 'pan', startX: x, viewStart: state.cmpView.startMs };
+    }
+  });
+  window.addEventListener('mousemove', function (ev) {
+    if (!cmpDrag || !state.compareOn) return;
+    var rect = cmpCanvas.getBoundingClientRect();
+    var x = ev.clientX - rect.left;
+    if (cmpDrag.mode === 'scrub') {
+      setPlayhead(cmpXToTime(x));
+      drawCompareCanvas();
+    } else if (cmpDrag.mode === 'pan') {
+      state.cmpView.startMs = cmpDrag.viewStart - (x - cmpDrag.startX) / state.cmpView.pxPerMs;
+      drawCompareCanvas();
+    }
+  });
+  window.addEventListener('mouseup', function (ev) {
+    if (!cmpDrag || !state.compareOn) { cmpDrag = null; return; }
+    if (cmpDrag.mode === 'hit') {
+      var h = cmpDrag.hit;
+      var c = h.track === 'a' ? state.doc.cues[h.i] : state.refDoc.cues[h.i];
+      setPlayhead(c.start);
+      if (h.track === 'a') selectCue(h.i, { center: false, scroll: false });
+      // 找到包含该 cue 的对照条目并滚动到
+      var idx = entryIdxOfCue(h.track, h.i);
+      if (idx >= 0) {
+        state.cmpSelected = idx;
+        renderCompare();
+        var row = cmpRowEls.find(function (r) { return r.idx === idx; });
+        if (row) row.el.scrollIntoView({ block: 'nearest' });
+      }
+      drawCompareCanvas();
+    }
+    cmpDrag = null;
+  });
+  cmpCanvas.addEventListener('wheel', function (ev) {
+    if (!state.compareOn) return;
+    ev.preventDefault();
+    var rect = cmpCanvas.getBoundingClientRect();
+    var x = ev.clientX - rect.left;
+    if (ev.shiftKey || Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) {
+      state.cmpView.startMs += (ev.deltaX || ev.deltaY) / state.cmpView.pxPerMs;
+      drawCompareCanvas();
+    } else {
+      var np = clamp(state.cmpView.pxPerMs * Math.pow(1.0015, -ev.deltaY), MIN_PX, MAX_PX);
+      var anchor = cmpXToTime(x);
+      var real = np / state.cmpView.pxPerMs;
+      state.cmpView.startMs = anchor - (anchor - state.cmpView.startMs) / real;
+      state.cmpView.pxPerMs = np;
+      drawCompareCanvas();
+    }
+  }, { passive: false });
+
+  function entryIdxOfCue(track, i) {
+    var entries = state.refResult.entries;
+    for (var k = 0; k < entries.length; k++) {
+      var e = entries[k];
+      if (track === 'a' && e.kind !== 'only-b' && i >= e.ai && i < e.ai + (e.alen || 1)) return k;
+      if (track === 'b' && e.kind !== 'only-a' && i >= e.bj && i < e.bj + (e.blen || 1)) return k;
+    }
+    return -1;
+  }
+
+  // 播放头变化时双层时间轴同步重绘（updatePlayUI 内调用 syncComparePlayhead）
+
+  // 撤销 / 重做 / 外部编辑后：重新对齐，并按“当前内容是否真的等于对照版”
+  // 重算已采用标记（不能直接迁移旧标记，否则撤销后仍显示已采用、批量也会漏项）。
+  function syncCompareAfterEdit() {
+    if (!state.refDoc) return;
+    runAlign();
+    state.adopted = recomputeAdopted();
+    renderCompare();
+    drawCompareCanvas();
+  }
+
+  function recomputeAdopted() {
+    var out = {};
+    if (!state.refResult) return out;
+    var cur = state.doc.cues, ref = state.refDoc.cues;
+    function norm(lines) { return C.normalizeText(lines.join(' ')); }
+    state.refResult.entries.forEach(function (e, i) {
+      if (e.kind === 'pair') {
+        if (e.ai + e.alen > cur.length) return;
+        var aText = norm(cur.slice(e.ai, e.ai + e.alen).flatMap(function (c) { return c.lines; }));
+        var bText = norm(ref.slice(e.bj, e.bj + e.blen).flatMap(function (c) { return c.lines; }));
+        var textMatch = aText === bText;
+        var ga = spanOf(cur, e.ai, e.alen), gb = spanOf(ref, e.bj, e.blen);
+        var timeMatch = ga.start === gb.start && ga.end === gb.end;
+        var structural = e.alen !== 1 || e.blen !== 1;
+        if (structural) {
+          // 结构组：只有当前侧条数、各条时间与文本都已等于对照版，才算整组采用；
+          // 不能只看合并文本（1↔2 的两侧合起来文本天然相同）。
+          var sameShape = e.alen === e.blen &&
+            e.alen === countOverlapping(cur, ga) && e.blen === countOverlapping(ref, gb);
+          if (sameShape) {
+            var perLine = true;
+            for (var k = 0; k < e.alen; k++) {
+              if (cur[e.ai + k].start !== ref[e.bj + k].start ||
+                  cur[e.ai + k].end !== ref[e.bj + k].end ||
+                  norm(cur[e.ai + k].lines) !== norm(ref[e.bj + k].lines)) {
+                perLine = false; break;
+              }
+            }
+            if (perLine) out[i] = 'group';
+          }
+          return;
+        }
+        if (textMatch && timeMatch) out[i] = 'full';
+        else if (textMatch) out[i] = 'text';
+        else if (timeMatch) out[i] = 'time';
+      } else if (e.kind === 'only-b') {
+        var r = ref[e.bj];
+        var hit = cur.some(function (c) {
+          return c.start === r.start && c.end === r.end && norm(c.lines) === norm(r.lines);
+        });
+        if (hit) out[i] = 'insert';
+      }
+      // only-a 删除状态无法可靠回推，保持无标记
+    });
+    return out;
+  }
+
+  // 与区间 [s,e] 时间上重叠（非零）的 cue 数量，用于结构组形状校验
+  function countOverlapping(list, span) {
+    var n = 0;
+    list.forEach(function (c) {
+      if (c.start < span.end && c.end > span.start) n++;
+    });
+    return n;
+  }
+
   // ---------- 初始化 ----------
   function init() {
     loadSettings();
@@ -1652,6 +2509,7 @@
     resizeCanvas();
     if (window.ResizeObserver) {
       new ResizeObserver(resizeCanvas).observe(timelineWrap);
+      new ResizeObserver(function () { if (state.compareOn) resizeCompareCanvas(); }).observe(compareView);
     } else {
       window.addEventListener('resize', resizeCanvas);
     }

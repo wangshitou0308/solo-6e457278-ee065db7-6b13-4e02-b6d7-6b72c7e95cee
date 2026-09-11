@@ -55,6 +55,22 @@
   var mergeModal = $('mergeModal'), mergeSummary = $('mergeSummary'), mergeTbody = $('mergeTbody');
   var btnMergeCancel = $('btnMergeCancel'), btnMergeApply = $('btnMergeApply');
   var timelineWrapEl = $('timelineWrap'), cueListWrapEl = $('cueListWrap');
+  // 镜头切换检测
+  var sceneRange = $('sceneRange'), sceneRangeInputs = $('sceneRangeInputs');
+  var sceneFrom = $('sceneFrom'), sceneTo = $('sceneTo');
+  var sceneInterval = $('sceneInterval'), sceneSens = $('sceneSens'), sceneSensVal = $('sceneSensVal');
+  var sceneTol = $('sceneTol');
+  var btnSceneScan = $('btnSceneScan'), btnSceneCancel = $('btnSceneCancel');
+  var btnSceneSnapAll = $('btnSceneSnapAll'), btnSceneClear = $('btnSceneClear');
+  var sceneProgress = $('sceneProgress'), sceneProgressFill = $('sceneProgressFill');
+  var sceneState = $('sceneState');
+  var cutModal = $('cutModal'), cutInfo = $('cutInfo'), cutCueInfo = $('cutCueInfo');
+  var cutThumbBefore = $('cutThumbBefore'), cutThumbAfter = $('cutThumbAfter');
+  var cutTBefore = $('cutTBefore'), cutTAfter = $('cutTAfter'), cutThumbHint = $('cutThumbHint');
+  var btnCutSnapStart = $('btnCutSnapStart'), btnCutSnapEnd = $('btnCutSnapEnd'), btnCutClose = $('btnCutClose');
+  var cutBatchModal = $('cutBatchModal'), cutBatchSummary = $('cutBatchSummary');
+  var cutBatchTbody = $('cutBatchTbody');
+  var btnCutBatchCancel = $('btnCutBatchCancel'), btnCutBatchApply = $('btnCutBatchApply');
   var anchorCells = {
     a1: { cue: $('a1Cue'), src: $('a1Src'), dst: $('a1Dst') },
     a2: { cue: $('a2Cue'), src: $('a2Src'), dst: $('a2Dst') },
@@ -70,6 +86,7 @@
   var TYPE_LABEL = {
     cps: '语速', short: '过短', gap: '间隔', overlap: '重叠', order: '时序',
     longline: '超长行', orphan: '孤立标点', toomany: '超行数',
+    'cut-cross': '跨切点', 'cut-near': '近切点',
   };
 
   // ---------- 状态 ----------
@@ -106,6 +123,15 @@
     cmpSelected: -1,                    // 当前选中的对照条目
     adopted: {},                        // 已逐项采用的条目：entryIdx → 模式
     pendingMerge: null,                 // 批量合并预览
+    // 镜头切换检测（分析数据与缩略图只在内存，卸载媒体 / 刷新即清除）
+    scene: {
+      cuts: [],                         // [{time, strength(0..1)}]
+      thumbs: {},                       // cutIdx → {before, after}（dataURL，仅内存）
+      running: false, cancel: false,
+      cfg: { range: 'all', from: 0, to: 0, interval: 250, sens: 60, tol: 400 },
+    },
+    cutDetail: null,                    // {cue, cutIdx} 切点详情弹窗当前条目
+    pendingCutSnap: null,               // 批量吸附预览计划
   };
   var rowEls = [];        // 每行 DOM 缓存
   var activeRowIdx = -1;  // 播放头当前所在字幕行
@@ -229,6 +255,7 @@
     updateButtons();
     updateSnapButtons();
     updateAnchorButtons();
+    updateSceneButtons();
     setStatus('已载入 ' + fileName + '（' + doc.cues.length + ' 条，' + doc.format.toUpperCase() + '）');
     checkDraft();
   }
@@ -607,7 +634,10 @@
       return;
     }
     state.problems = C.analyze(state.doc.cues, state.settings)
-      .concat(C.analyzeLayout(state.doc.cues, state.settings.maxChars, state.settings.maxLines));
+      .concat(C.analyzeLayout(state.doc.cues, state.settings.maxChars, state.settings.maxLines))
+      .concat(state.scene.cuts.length
+        ? C.analyzeCutConflicts(state.doc.cues, state.scene.cuts, state.scene.cfg.tol)
+        : []);
     state.problemByCue = {};
     state.problems.forEach(function (p) {
       (state.problemByCue[p.cue] = state.problemByCue[p.cue] || []).push(p.type);
@@ -652,7 +682,12 @@
         '<span class="p-text">' + esc(cue.lines.join(' / ')) + '</span></span>';
       li.addEventListener('click', function () {
         selectCue(p.cue, { center: true, scroll: true });
-        setStatus('定位到第 ' + cue.num + ' 条');
+        if (p.type === 'cut-cross' || p.type === 'cut-near') {
+          // 切点问题：展示切点前后缩略图并同步定位媒体
+          openCutDetail(p.cue, p.cutIdx);
+        } else {
+          setStatus('定位到第 ' + cue.num + ' 条');
+        }
       });
       frag.appendChild(li);
     });
@@ -717,7 +752,31 @@
     ctx.clearRect(0, 0, cssW, cssH);
     drawRuler();
     if (state.doc) drawCues();
+    drawSceneCuts();
     drawPlayhead();
+  }
+
+  // 镜头切点叠加层：竖线透明度随变化强度，顶部三角标记
+  function drawSceneCuts() {
+    if (!state.scene.cuts.length) return;
+    state.scene.cuts.forEach(function (cut) {
+      var x = timeToX(cut.time);
+      if (x < -2 || x > cssW + 2) return;
+      var strength = clamp(cut.strength || 0, 0, 1);
+      ctx.strokeStyle = 'rgba(94, 234, 212, ' + (0.3 + 0.5 * strength).toFixed(3) + ')';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x, RULER_H);
+      ctx.lineTo(x, cssH - 4);
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(94, 234, 212, ' + (0.55 + 0.45 * strength).toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(x - 4, RULER_H + 1);
+      ctx.lineTo(x + 4, RULER_H + 1);
+      ctx.lineTo(x, RULER_H + 7);
+      ctx.closePath();
+      ctx.fill();
+    });
   }
 
   function drawRuler() {
@@ -1069,6 +1128,9 @@
 
   function loadMediaFile(f) {
     if (state.media.pending) URL.revokeObjectURL(state.media.pending.url);
+    // 更换媒体：旧切点与新画面不再对应，连同内存中的缩略图一并清除
+    if (state.scene.running) state.scene.cancel = true;
+    clearCutData(true);
     var url = URL.createObjectURL(f);
     var isVideo = /^video\//.test(f.type) || /\.(mp4|webm|mkv|mov|m4v)$/i.test(f.name);
     state.media.pending = { url: url, name: f.name, isVideo: isVideo };
@@ -1097,6 +1159,11 @@
     btnUnloadMedia.classList.remove('hidden');
     hideMediaBanner();
     try { localStorage.setItem(MEDIA_MARK_KEY, JSON.stringify({ name: p.name })); } catch (e) {}
+    // 区间检测的默认终点跟随新媒体时长
+    if (p.isVideo && state.media.duration > 0) {
+      sceneTo.value = (state.media.duration / 1000).toFixed(1);
+    }
+    updateSceneButtons();
     setPlayhead(0);
     setStatus('已载入媒体《' + p.name + '》（仅本地对象 URL，不上传）。拖动播放头即可联动定位。');
   });
@@ -1130,6 +1197,14 @@
 
   function resetMediaState() {
     if (state.playing) setPlaying(false);
+    // 卸载媒体：中止进行中的检测，并清除只存在于内存的切点与缩略图
+    if (state.scene.running) state.scene.cancel = true;
+    clearCutData(true);
+    if (scanVideo) {
+      scanVideo.removeAttribute('src');
+      scanVideo.load();
+      scanReadyUrl = null;
+    }
     if (state.media.pending) {
       URL.revokeObjectURL(state.media.pending.url);
       state.media.pending = null;
@@ -1144,6 +1219,7 @@
     mediaState.textContent = '未载入媒体 · 模拟播放头';
     try { localStorage.removeItem(MEDIA_MARK_KEY); } catch (e) {}
     updatePlayUI();
+    updateSceneButtons();
   }
   btnUnloadMedia.addEventListener('click', function () {
     resetMediaState();
@@ -1372,6 +1448,14 @@
     }
     if (!mergeModal.classList.contains('hidden')) {
       if (e.key === 'Escape') hideMergeModal();
+      return;
+    }
+    if (!cutModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') hideCutDetail();
+      return;
+    }
+    if (!cutBatchModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') hideCutBatch();
       return;
     }
     var step = e.shiftKey ? 500 : (e.altKey ? 10 : 100);
@@ -2497,13 +2581,514 @@
     return n;
   }
 
+  // ============================================================
+  // 镜头切换辅助校时
+  // 取帧在独立的隐藏 <video> 元素上进行（与播放互不影响）；
+  // 切点数据与缩略图只保存在内存，卸载媒体或刷新页面即清除。
+  // ============================================================
+
+  var SCENE_CFG_KEY = 'subcal.scenecfg';
+  var scanVideo = null, scanCanvas = null, scanCtx = null, scanReadyUrl = null;
+
+  // ---------- 配置 ----------
+  function loadSceneCfg() {
+    try {
+      var saved = JSON.parse(localStorage.getItem(SCENE_CFG_KEY) || '{}');
+      ['range', 'interval', 'sens', 'tol'].forEach(function (k) {
+        if (saved[k] !== undefined) state.scene.cfg[k] = saved[k];
+      });
+    } catch (e) { /* 忽略损坏的配置 */ }
+    var cfg = state.scene.cfg;
+    sceneRange.value = cfg.range;
+    sceneInterval.value = cfg.interval;
+    sceneSens.value = cfg.sens;
+    sceneSensVal.textContent = cfg.sens;
+    sceneTol.value = cfg.tol;
+    sceneRangeInputs.classList.toggle('hidden', cfg.range !== 'part');
+  }
+  function readSceneCfg() {
+    var cfg = state.scene.cfg;
+    cfg.range = sceneRange.value === 'part' ? 'part' : 'all';
+    cfg.interval = clamp(Math.round(+sceneInterval.value || 250), 40, 2000);
+    cfg.sens = clamp(Math.round(+sceneSens.value || 60), 1, 100);
+    cfg.tol = clamp(Math.round(+sceneTol.value || 0), 0, 2000);
+    cfg.from = Math.max(0, +sceneFrom.value || 0);
+    cfg.to = Math.max(0, +sceneTo.value || 0);
+    sceneInterval.value = cfg.interval;
+    sceneSens.value = cfg.sens;
+    sceneSensVal.textContent = cfg.sens;
+    sceneTol.value = cfg.tol;
+    try {
+      localStorage.setItem(SCENE_CFG_KEY, JSON.stringify({
+        range: cfg.range, interval: cfg.interval, sens: cfg.sens, tol: cfg.tol,
+      }));
+    } catch (e) {}
+  }
+  sceneRange.addEventListener('change', function () {
+    sceneRangeInputs.classList.toggle('hidden', sceneRange.value !== 'part');
+    readSceneCfg();
+  });
+  [sceneInterval, sceneSens, sceneTol, sceneFrom, sceneTo].forEach(function (el) {
+    el.addEventListener('change', function () {
+      readSceneCfg();
+      if (el === sceneTol) { analyzeAndRender(); updateSceneButtons(); }
+    });
+  });
+  sceneSens.addEventListener('input', function () { sceneSensVal.textContent = sceneSens.value; });
+
+  // 灵敏度 1..100 → 判定阈值 0.56..0.06（越高越灵敏，候选越多）
+  function sensToThreshold(sens) {
+    return 0.58 - clamp(sens, 1, 100) / 100 * 0.52;
+  }
+
+  // ---------- 按钮与状态 ----------
+  function updateSceneButtons() {
+    var hasVideo = state.media.ready && state.media.isVideo;
+    btnSceneScan.disabled = !hasVideo || state.scene.running;
+    btnSceneCancel.classList.toggle('hidden', !state.scene.running);
+    btnSceneSnapAll.disabled = !state.scene.cuts.length || !state.doc || state.scene.running;
+    btnSceneClear.classList.toggle('hidden', !state.scene.cuts.length);
+    if (state.scene.running) return;   // 运行中由进度函数更新文案
+    if (state.scene.cuts.length) {
+      sceneState.textContent = state.scene.cuts.length + ' 个切点 · 容差 ' +
+        state.scene.cfg.tol + 'ms（仅内存，卸载媒体即清除）';
+    } else if (state.media.ready && !state.media.isVideo) {
+      sceneState.textContent = '当前媒体为音频，无画面可供检测';
+    } else if (!state.media.ready) {
+      sceneState.textContent = '载入视频后可检测镜头切换';
+    } else {
+      sceneState.textContent = '未检测';
+    }
+  }
+  function setSceneProgress(frac, text) {
+    sceneProgressFill.style.width = Math.round(clamp(frac, 0, 1) * 100) + '%';
+    if (text) sceneState.textContent = text;
+  }
+  function sceneProgressShow(on) {
+    sceneProgress.classList.toggle('hidden', !on);
+    if (!on) sceneProgressFill.style.width = '0';
+  }
+
+  // ---------- 取帧（独立 video 元素，不影响播放与编辑） ----------
+  function ensureScanVideo() {
+    return new Promise(function (resolve, reject) {
+      if (!state.media.ready || !state.media.url) {
+        reject(new Error('未载入媒体，无法取帧'));
+        return;
+      }
+      if (scanVideo && scanReadyUrl === state.media.url) { resolve(); return; }
+      if (!scanVideo) {
+        scanVideo = document.createElement('video');
+        scanVideo.muted = true;
+        scanVideo.preload = 'auto';
+        scanCanvas = document.createElement('canvas');
+        scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
+      }
+      var settled = false;
+      var timer = setTimeout(function () {
+        finish(new Error('读取视频元数据超时（文件可能损坏或编码不受支持）'));
+      }, 8000);
+      function onMeta() {
+        if (!scanVideo.videoWidth) {
+          finish(new Error('该媒体不包含视频画面（可能是纯音频），无法进行镜头检测'));
+          return;
+        }
+        scanReadyUrl = state.media.url;
+        finish(null);
+      }
+      function onErr() {
+        var code = scanVideo.error && scanVideo.error.code;
+        var why = ({ 1: '读取被中止', 2: '网络错误',
+          3: '解码失败（编码不受支持或文件损坏）', 4: '格式或编码不受支持' })[code] || '未知错误';
+        finish(new Error('视频解码失败：' + why));
+      }
+      function finish(err) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        scanVideo.removeEventListener('loadedmetadata', onMeta);
+        scanVideo.removeEventListener('error', onErr);
+        if (err) reject(err); else resolve();
+      }
+      scanVideo.addEventListener('loadedmetadata', onMeta);
+      scanVideo.addEventListener('error', onErr);
+      scanVideo.removeAttribute('src');
+      scanVideo.src = state.media.url;
+      scanVideo.load();
+    });
+  }
+
+  // 在 tMs 处取一帧并缩放到指定宽度，返回 ImageData；失败时说明原因
+  function grabFrameAt(tMs, width) {
+    return new Promise(function (resolve, reject) {
+      if (!scanVideo || scanReadyUrl !== state.media.url) {
+        reject(new Error('取帧器未就绪（媒体可能已卸载）'));
+        return;
+      }
+      var settled = false;
+      var timer = setTimeout(function () {
+        finish(new Error('在 ' + C.fmtShort(tMs) + ' 处取帧超时（解码缓慢或文件已不可用）'));
+      }, 6000);
+      function onSeek() {
+        try {
+          var vw = scanVideo.videoWidth, vh = scanVideo.videoHeight;
+          if (!vw || !vh) { finish(new Error('无法读取视频画面尺寸（可能为纯音频）')); return; }
+          var w = width || 160;
+          var h = Math.max(2, Math.round(w * vh / vw));
+          if (scanCanvas.width !== w) scanCanvas.width = w;
+          if (scanCanvas.height !== h) scanCanvas.height = h;
+          scanCtx.drawImage(scanVideo, 0, 0, w, h);
+          finish(null, scanCtx.getImageData(0, 0, w, h));
+        } catch (e) {
+          finish(new Error('画面读取失败：' + (e && e.message ? e.message : e)));
+        }
+      }
+      function onErr() { finish(new Error('取帧过程中视频解码出错')); }
+      function finish(err, img) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        scanVideo.removeEventListener('seeked', onSeek);
+        scanVideo.removeEventListener('error', onErr);
+        if (err) reject(err); else resolve(img);
+      }
+      scanVideo.addEventListener('seeked', onSeek);
+      scanVideo.addEventListener('error', onErr);
+      try {
+        scanVideo.currentTime = Math.max(0, tMs / 1000);
+      } catch (e) {
+        finish(new Error('无法定位到 ' + C.fmtShort(tMs) + '：' + (e && e.message ? e.message : e)));
+      }
+    });
+  }
+
+  function imgToDataURL(img) {
+    var c = document.createElement('canvas');
+    c.width = img.width;
+    c.height = img.height;
+    c.getContext('2d').putImageData(img, 0, 0);
+    return c.toDataURL('image/jpeg', 0.7);
+  }
+
+  // ---------- 检测主流程（粗扫 → 候选区间细化，可取消） ----------
+  async function runSceneScan() {
+    if (state.scene.running) return;
+    if (!state.media.ready) { setStatus('请先载入本地视频，再进行镜头检测'); return; }
+    if (!state.media.isVideo) { setStatus('当前媒体是音频，没有画面可供镜头检测'); return; }
+    readSceneCfg();
+    var cfg = state.scene.cfg;
+    var durMs = Math.round(state.media.duration);
+    var fromMs = 0, toMs = durMs;
+    if (cfg.range === 'part') {
+      fromMs = clamp(Math.round(cfg.from * 1000), 0, durMs);
+      toMs = cfg.to > 0 ? clamp(Math.round(cfg.to * 1000), 0, durMs) : durMs;
+      if (toMs - fromMs < cfg.interval * 2) {
+        setStatus('选定区间过短（' + C.fmtShort(fromMs) + ' ~ ' + C.fmtShort(toMs) +
+          '），需至少覆盖 2 个采样间隔');
+        return;
+      }
+    }
+    state.scene.running = true;
+    state.scene.cancel = false;
+    clearCutData(true);
+    updateSceneButtons();
+    sceneProgressShow(true);
+    try {
+      setSceneProgress(0.02, '正在准备视频解码…');
+      await ensureScanVideo();
+      var threshold = sensToThreshold(cfg.sens);
+      // —— 第一遍：按采样间隔粗扫，比较相邻帧亮度与色彩直方图 ——
+      var samples = [];
+      var total = Math.max(1, Math.floor((toMs - fromMs) / cfg.interval) + 1);
+      var n = 0;
+      for (var t = fromMs; t <= toMs + 1; t += cfg.interval) {
+        if (state.scene.cancel) throw { cancelled: true };
+        var ts = Math.min(t, durMs - 1);
+        var img = await grabFrameAt(ts, 160);
+        samples.push({ t: t, metrics: C.frameMetrics(img.data, 8) });
+        n++;
+        if (n % 3 === 0 || n >= total) {
+          setSceneProgress(0.05 + 0.55 * Math.min(1, n / total),
+            '粗扫 ' + n + '/' + total + ' 帧（可取消，播放与编辑不受影响）');
+        }
+      }
+      if (samples.length < 2) throw new Error('区间内有效采样不足 2 帧，无法比较相邻帧');
+      var cands = C.findCutCandidates(samples, threshold, Math.max(2 * cfg.interval, 300));
+      // —— 第二遍：在每个候选区间内加密采样，细化切点位置 ——
+      var cuts = [];
+      for (var ci = 0; ci < cands.length; ci++) {
+        if (state.scene.cancel) throw { cancelled: true };
+        var c = cands[ci];
+        var lo = samples[c.i - 1].t, hi = c.t;
+        var step = Math.max(33, Math.round((hi - lo) / 8));
+        var fine = [];
+        for (var ft = lo; ft <= hi + 1; ft += step) {
+          var fimg = await grabFrameAt(Math.min(ft, durMs - 1), 160);
+          fine.push({ t: Math.round(ft), metrics: C.frameMetrics(fimg.data, 8) });
+        }
+        var r = C.refineCutWindow(fine);
+        if (r) cuts.push({ time: Math.round(r.t), strength: r.score });
+        setSceneProgress(0.6 + 0.4 * ((ci + 1) / cands.length),
+          '细化切点 ' + (ci + 1) + '/' + cands.length);
+      }
+      // 细化后可能出现过近的重复切点：200ms 内保留强度最高者
+      cuts.sort(function (a, b) { return a.time - b.time; });
+      var merged = [];
+      cuts.forEach(function (ct) {
+        var last = merged[merged.length - 1];
+        if (last && ct.time - last.time < 200) {
+          if (ct.strength > last.strength) merged[merged.length - 1] = ct;
+        } else {
+          merged.push(ct);
+        }
+      });
+      state.scene.cuts = merged;
+      state.scene.thumbs = {};
+      setSceneProgress(1, '');
+      setStatus('镜头检测完成：' + merged.length + ' 个切点（' +
+        C.fmtShort(fromMs) + ' ~ ' + C.fmtShort(toMs) + '，采样 ' + n + ' 帧）');
+    } catch (e) {
+      if (e && e.cancelled) {
+        setStatus('已取消镜头检测');
+      } else if (!state.media.ready) {
+        setStatus('镜头检测中止：媒体已卸载，分析数据已清除');
+      } else {
+        setStatus('镜头检测失败：' + (e && e.message ? e.message : e));
+      }
+    } finally {
+      state.scene.running = false;
+      state.scene.cancel = false;
+      sceneProgressShow(false);
+      updateSceneButtons();
+      analyzeAndRender();
+      drawCanvas();
+    }
+  }
+  btnSceneScan.addEventListener('click', runSceneScan);
+  btnSceneCancel.addEventListener('click', function () {
+    if (state.scene.running) {
+      state.scene.cancel = true;
+      sceneState.textContent = '正在取消…';
+    }
+  });
+
+  // ---------- 清除（卸载媒体 / 手动清除；数据仅内存） ----------
+  function clearCutData(silent) {
+    state.scene.cuts = [];
+    state.scene.thumbs = {};
+    state.cutDetail = null;
+    state.pendingCutSnap = null;
+    cutModal.classList.add('hidden');
+    cutBatchModal.classList.add('hidden');
+    updateSceneButtons();
+    analyzeAndRender();
+    drawCanvas();
+    if (!silent) setStatus('已清除镜头切点（数据本就在内存中，未写入任何存储）');
+  }
+  btnSceneClear.addEventListener('click', function () { clearCutData(false); });
+
+  // ---------- 切点详情弹窗（前后缩略图 + 逐条吸附） ----------
+  function openCutDetail(cueIdx, cutIdx) {
+    var cut = state.scene.cuts[cutIdx];
+    if (!cut || !state.doc) return;
+    state.cutDetail = { cue: cueIdx, cutIdx: cutIdx };
+    renderCutModal();
+    cutModal.classList.remove('hidden');
+    setPlayhead(cut.time);   // 同步定位媒体与播放头
+    fillCutThumbs(cutIdx);
+    setStatus('切点 ' + C.fmtMs(cut.time, 'srt') + '：已同步定位媒体');
+  }
+  function hideCutDetail() {
+    cutModal.classList.add('hidden');
+    state.cutDetail = null;
+  }
+  btnCutClose.addEventListener('click', hideCutDetail);
+  cutModal.addEventListener('click', function (e) { if (e.target === cutModal) hideCutDetail(); });
+
+  function cutSnapError(cueIdx, cutIdx, field) {
+    var cue = state.doc.cues[cueIdx];
+    var cut = state.scene.cuts[cutIdx];
+    if (!cue || !cut) return '数据已失效';
+    if (field === 'start') {
+      if (cut.time < 0) return '切点时间为负，不能吸附';
+      if (cue.end - cut.time < MIN_DUR) {
+        return '吸附后时长不足 ' + MIN_DUR + 'ms（终点 ' + C.fmtMs(cue.end, 'srt') + '）';
+      }
+    } else {
+      if (cut.time - cue.start < MIN_DUR) {
+        return '吸附后时长不足 ' + MIN_DUR + 'ms（起点 ' + C.fmtMs(cue.start, 'srt') + '）';
+      }
+    }
+    return null;
+  }
+
+  function renderCutModal() {
+    var d = state.cutDetail;
+    if (!d || !state.doc) return;
+    var cut = state.scene.cuts[d.cutIdx];
+    var cue = state.doc.cues[d.cue];
+    if (!cut || !cue) { hideCutDetail(); return; }
+    cutInfo.textContent = '切点 ' + C.fmtMs(cut.time, 'srt') + ' · 变化强度 ' +
+      Math.round(clamp(cut.strength, 0, 1) * 100) + '% · 第 ' + (d.cutIdx + 1) + '/' +
+      state.scene.cuts.length + ' 个';
+    cutCueInfo.innerHTML = '第 <span class="mono">#' + esc(cue.num) + '</span> 条 · ' +
+      '<span class="mono">' + C.fmtMs(cue.start, 'srt') + ' → ' + C.fmtMs(cue.end, 'srt') +
+      '</span> · ' + esc(cue.lines.join(' / '));
+    var errS = cutSnapError(d.cue, d.cutIdx, 'start');
+    var errE = cutSnapError(d.cue, d.cutIdx, 'end');
+    btnCutSnapStart.disabled = !!errS;
+    btnCutSnapStart.title = errS || '把第 ' + cue.num + ' 条起点改为 ' + C.fmtMs(cut.time, 'srt');
+    btnCutSnapEnd.disabled = !!errE;
+    btnCutSnapEnd.title = errE || '把第 ' + cue.num + ' 条终点改为 ' + C.fmtMs(cut.time, 'srt');
+    cutTBefore.textContent = C.fmtShort(Math.max(0, cut.time - 80));
+    cutTAfter.textContent = C.fmtShort(cut.time + 80);
+  }
+
+  // 懒截取切点前后缩略图（仅内存缓存，卸载媒体即失效）
+  async function fillCutThumbs(cutIdx) {
+    var cut = state.scene.cuts[cutIdx];
+    if (!cut) return;
+    var cached = state.scene.thumbs[cutIdx];
+    if (cached) { showCutThumbs(cached); return; }
+    cutThumbBefore.removeAttribute('src');
+    cutThumbAfter.removeAttribute('src');
+    cutThumbHint.textContent = '正在截取切点前后画面…';
+    try {
+      if (!state.media.ready) throw new Error('媒体已卸载，无法截取');
+      await ensureScanVideo();
+      var durMs = Math.round(state.media.duration);
+      var before = await grabFrameAt(clamp(cut.time - 80, 0, Math.max(0, durMs - 1)), 240);
+      var after = await grabFrameAt(clamp(cut.time + 80, 0, Math.max(0, durMs - 1)), 240);
+      var thumbs = { before: imgToDataURL(before), after: imgToDataURL(after) };
+      state.scene.thumbs[cutIdx] = thumbs;
+      if (state.cutDetail && state.cutDetail.cutIdx === cutIdx &&
+        !cutModal.classList.contains('hidden')) {
+        showCutThumbs(thumbs);
+      }
+    } catch (e) {
+      if (!cutModal.classList.contains('hidden')) {
+        cutThumbHint.textContent = '缩略图截取失败：' + (e && e.message ? e.message : e);
+      }
+    }
+  }
+  function showCutThumbs(thumbs) {
+    cutThumbBefore.src = thumbs.before;
+    cutThumbAfter.src = thumbs.after;
+    cutThumbHint.textContent = '';
+  }
+
+  // 逐条吸附：把当前详情字幕的起点 / 终点吸附到切点
+  function doCutSnap(field) {
+    var d = state.cutDetail;
+    if (!d || !state.doc) return;
+    var cue = state.doc.cues[d.cue];
+    var cut = state.scene.cuts[d.cutIdx];
+    if (!cue || !cut) { hideCutDetail(); return; }
+    var err = cutSnapError(d.cue, d.cutIdx, field);
+    if (err) { setStatus('无法吸附：' + err); return; }
+    pushUndo('cutsnap');
+    if (field === 'start') cue.start = cut.time;
+    else cue.end = cut.time;
+    fillRowTimes(d.cue);
+    afterChange('已将第 ' + cue.num + ' 条' + (field === 'start' ? '起点' : '终点') +
+      ' 吸附到切点 ' + C.fmtMs(cut.time, 'srt'));
+    renderCutModal();
+  }
+  btnCutSnapStart.addEventListener('click', function () { doCutSnap('start'); });
+  btnCutSnapEnd.addEventListener('click', function () { doCutSnap('end'); });
+
+  // ---------- 批量吸附预览 ----------
+  btnSceneSnapAll.addEventListener('click', function () {
+    if (!state.doc || !state.scene.cuts.length) return;
+    commitAllRows();
+    var plan = C.planCutSnap(state.doc.cues, state.scene.cuts, state.scene.cfg.tol, {
+      allowOverlap: state.settings.allowOverlap,
+      minDurMs: MIN_DUR,
+    });
+    if (!plan.changes.length && !plan.skipped.length) {
+      setStatus('容差 ' + state.scene.cfg.tol + 'ms 内没有需要吸附的起止点');
+      return;
+    }
+    state.pendingCutSnap = plan;
+    renderCutBatch();
+    cutBatchModal.classList.remove('hidden');
+  });
+
+  function renderCutBatch() {
+    var plan = state.pendingCutSnap;
+    if (!plan || !state.doc) return;
+    cutBatchSummary.textContent = '容差 ' + state.scene.cfg.tol + 'ms：将调整 ' +
+      plan.changes.length + ' 条；排除 ' + plan.skipped.length +
+      ' 条（负时间 / 无效时长 / 倒序 / 规则不允许的重叠）。应用后可用 Ctrl+Z 整体撤销。';
+    cutBatchTbody.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    plan.changes.forEach(function (ch) {
+      var cue = state.doc.cues[ch.i];
+      var tr = document.createElement('tr');
+      var edge = [];
+      if (ch.snapStart) edge.push('起点');
+      if (ch.snapEnd) edge.push('终点');
+      tr.innerHTML =
+        '<td class="mono">#' + esc(ch.num) + '</td>' +
+        '<td>' + (ch.snapStart
+          ? '<span class="old mono">' + C.fmtMs(ch.oldStart, 'srt') + '</span> → <span class="new">' +
+            C.fmtMs(ch.newStart, 'srt') + '</span>'
+          : '<span class="mono">' + C.fmtMs(ch.oldStart, 'srt') + '</span>') + '</td>' +
+        '<td>' + (ch.snapEnd
+          ? '<span class="old mono">' + C.fmtMs(ch.oldEnd, 'srt') + '</span> → <span class="new">' +
+            C.fmtMs(ch.newEnd, 'srt') + '</span>'
+          : '<span class="mono">' + C.fmtMs(ch.oldEnd, 'srt') + '</span>') + '</td>' +
+        '<td><span class="cb-edge">吸附' + edge.join('+') + '</span> ' +
+          esc(cue.lines.join(' / ')) + '</td>';
+      frag.appendChild(tr);
+    });
+    plan.skipped.forEach(function (sk) {
+      var cue = state.doc.cues[sk.i];
+      var tr = document.createElement('tr');
+      tr.className = 'cbskip';
+      tr.innerHTML =
+        '<td class="mono">#' + esc(sk.num) + '</td>' +
+        '<td class="mono">' + C.fmtMs(cue.start, 'srt') + '</td>' +
+        '<td class="mono">' + C.fmtMs(cue.end, 'srt') + '</td>' +
+        '<td><span class="cb-reason">排除：' + esc(sk.reason) + '</span> ' +
+          esc(cue.lines.join(' / ')) + '</td>';
+      frag.appendChild(tr);
+    });
+    cutBatchTbody.appendChild(frag);
+    btnCutBatchApply.disabled = plan.changes.length === 0;
+  }
+
+  function hideCutBatch() {
+    cutBatchModal.classList.add('hidden');
+    state.pendingCutSnap = null;
+  }
+  btnCutBatchCancel.addEventListener('click', hideCutBatch);
+  cutBatchModal.addEventListener('click', function (e) { if (e.target === cutBatchModal) hideCutBatch(); });
+  btnCutBatchApply.addEventListener('click', function () {
+    var plan = state.pendingCutSnap;
+    if (!plan || !state.doc) { hideCutBatch(); return; }
+    if (!plan.changes.length) { hideCutBatch(); return; }
+    pushUndo('cutsnapbatch');
+    plan.changes.forEach(function (ch) {
+      var cue = state.doc.cues[ch.i];
+      cue.start = ch.newStart;
+      cue.end = ch.newEnd;
+    });
+    hideCutBatch();
+    renderList();
+    afterChange('已批量吸附 ' + plan.changes.length + ' 条到切点' +
+      (plan.skipped.length ? '（排除 ' + plan.skipped.length + ' 条不合规项）' : ''));
+  });
+
   // ---------- 初始化 ----------
   function init() {
     loadSettings();
+    loadSceneCfg();
     updateButtons();
     updateUndoButtons();
     updateSnapButtons();
     updateAnchorButtons();
+    updateSceneButtons();
     loopPadBefore.value = state.loop.padBefore;
     loopPadAfter.value = state.loop.padAfter;
     resizeCanvas();

@@ -106,6 +106,34 @@
   <span id="nowCueText" class="muted grow"></span>
 </section>
 
+<section id="sceneBar">
+  <span class="label">镜头检测：</span>
+  <label title="分析整段视频或指定起止区间">范围
+    <select id="sceneRange">
+      <option value="all" selected>整段视频</option>
+      <option value="part">选定区间</option>
+    </select>
+  </label>
+  <span id="sceneRangeInputs" class="hidden">
+    <label title="区间起点（秒）">从 <input type="number" id="sceneFrom" min="0" step="0.5"> s</label>
+    <label title="区间终点（秒，0 或留空表示到视频末尾）">到 <input type="number" id="sceneTo" min="0" step="0.5"> s</label>
+  </span>
+  <label title="相邻采样帧的时间间隔，越小越精确但越慢">采样间隔
+    <input type="number" id="sceneInterval" min="40" max="2000" step="10"> ms</label>
+  <label title="灵敏度越高，检出的弱变化切点越多">灵敏度
+    <input type="range" id="sceneSens" min="1" max="100" step="1">
+    <span id="sceneSensVal" class="mono"></span>
+  </label>
+  <label title="判定字幕起止「接近切点」的容差，吸附也以此为范围">容差
+    <input type="number" id="sceneTol" min="0" max="2000" step="10"> ms</label>
+  <button id="btnSceneScan" class="accent" disabled title="比较相邻帧的亮度与色彩直方图，检测镜头切换（分析期间可继续播放与编辑）">开始检测</button>
+  <button id="btnSceneCancel" class="hidden">取消检测</button>
+  <button id="btnSceneSnapAll" disabled title="把容差内未贴合的字幕起点/终点批量吸附到切点（先预览，排除负时间/无效时长/倒序/不允许的重叠）">批量吸附切点…</button>
+  <button id="btnSceneClear" class="hidden" title="清除检测结果与内存中的缩略图">清除切点</button>
+  <span id="sceneProgress" class="hidden"><span id="sceneProgressFill"></span></span>
+  <span id="sceneState" class="muted grow">载入视频后可检测镜头切换</span>
+</section>
+
 <main id="workspace">
   <section id="leftPane">
   <div id="compareBar" class="hidden">
@@ -293,6 +321,49 @@
     <div class="row-end">
       <button id="btnMergeCancel">取消</button>
       <button id="btnMergeApply" class="primary">应用合并</button>
+    </div>
+  </div>
+</div>
+
+<div id="cutModal" class="hidden">
+  <div id="cutBox">
+    <h3>镜头切点详情</h3>
+    <p class="muted" id="cutInfo"></p>
+    <div id="cutThumbs">
+      <figure>
+        <img id="cutThumbBefore" alt="切点前画面">
+        <figcaption>切点前 <span id="cutTBefore" class="mono"></span></figcaption>
+      </figure>
+      <figure>
+        <img id="cutThumbAfter" alt="切点后画面">
+        <figcaption>切点后 <span id="cutTAfter" class="mono"></span></figcaption>
+      </figure>
+    </div>
+    <p id="cutThumbHint" class="muted"></p>
+    <p id="cutCueInfo"></p>
+    <div class="row-end">
+      <button id="btnCutSnapStart" class="accent" title="把该字幕的起点吸附到此切点">⇤ 起点吸附到切点</button>
+      <button id="btnCutSnapEnd" class="accent" title="把该字幕的终点吸附到此切点">终点吸附到切点 ⇥</button>
+      <button id="btnCutClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="cutBatchModal" class="hidden">
+  <div id="cutBatchBox">
+    <h3>批量吸附切点 — 调整预览</h3>
+    <p class="muted" id="cutBatchSummary"></p>
+    <div id="cutBatchTableWrap">
+      <table id="cutBatchTable">
+        <thead>
+          <tr><th>#</th><th>开始（前 → 后）</th><th>结束（前 → 后）</th><th>文本 / 排除原因</th></tr>
+        </thead>
+        <tbody id="cutBatchTbody"></tbody>
+      </table>
+    </div>
+    <div class="row-end">
+      <button id="btnCutBatchCancel">取消</button>
+      <button id="btnCutBatchApply" class="primary">应用调整</button>
     </div>
   </div>
 </div>

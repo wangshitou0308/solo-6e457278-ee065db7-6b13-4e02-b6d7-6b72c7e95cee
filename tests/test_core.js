@@ -655,5 +655,141 @@ function mkCue(num, s, e, lines, settings, autoNum) {
   eq(p2.applied.length, 0, '无 actions 时不应用任何条目');
 }
 
+// ---- 镜头切点检测：帧指标与差异 ----
+function solidFrame(r, g, b, px) {
+  px = px || 16;
+  const a = new Uint8ClampedArray(px * 4);
+  for (let i = 0; i < px * 4; i += 4) { a[i] = r; a[i + 1] = g; a[i + 2] = b; a[i + 3] = 255; }
+  return a;
+}
+const mRed = Core.frameMetrics(solidFrame(220, 30, 30), 8);
+const mRed2 = Core.frameMetrics(solidFrame(220, 30, 30), 8);
+const mBlue = Core.frameMetrics(solidFrame(30, 30, 220), 8);
+const mDark = Core.frameMetrics(solidFrame(10, 10, 10), 8);
+ok(Math.abs(mRed.lum - (0.2126 * 220 + 0.7152 * 30 + 0.0722 * 30)) < 0.5, '亮度均值按 Rec.709 加权');
+eq(mRed.hist.length, 24, '直方图为 3×8 桶');
+ok(Math.abs(mRed.hist.reduce((s, v) => s + v, 0) - 3) < 1e-9, '直方图按通道归一化');
+eq(Core.metricsDelta(mRed, mRed2), 0, '相同帧差异为 0');
+const dRB = Core.metricsDelta(mRed, mBlue);
+ok(dRB > 0.4, '红→蓝硬切差异显著：' + dRB.toFixed(3));
+const dRD = Core.metricsDelta(mRed, mDark);
+ok(dRD > 0 && dRD < dRB, '同色系变暗差异小于换色：' + dRD.toFixed(3));
+ok(Core.metricsDelta(mRed, mBlue) <= 1, '差异上界为 1');
+
+// ---- 粗检测：阈值 + 非极大值抑制 ----
+function seqOf(pattern) {   // pattern: 'R'/'B'/'D' 序列 → 采样序列
+  const map = { R: mRed, B: mBlue, D: mDark };
+  return pattern.split('').map((ch, i) => ({ t: i * 250, metrics: map[ch] }));
+}
+{
+  const cands = Core.findCutCandidates(seqOf('RRRRRBBBBB'), 0.2, 500);
+  eq(cands.length, 1, '单次硬切检出一个候选');
+  eq(cands[0].t, 1250, '候选时间为首个新镜头帧');
+  eq(cands[0].i, 5, '候选下标指向后一帧');
+  eq(Core.findCutCandidates(seqOf('RRRRRBBBBB'), 0.99, 500).length, 0, '阈值过高无候选');
+  eq(Core.findCutCandidates(seqOf('RRRRRRRRRR'), 0.2, 500).length, 0, '无变化无候选');
+  // 相邻 250ms 内的两个超阈值边界 → NMS 只留最强
+  const two = Core.findCutCandidates(seqOf('RRBDB'), 0.05, 500);
+  eq(two.length, 1, '近距候选被非极大值抑制合并');
+  // 相距足够远的两次切换都保留
+  const far = Core.findCutCandidates(seqOf('RRRRBBBBDDDD'), 0.2, 500);
+  eq(far.length, 2, '相距够远的两次切换各自保留');
+}
+
+// ---- 候选区间细化 ----
+{
+  const fine = seqOf('RRRRBBBB');           // 切点在第 4→5 帧之间
+  const r = Core.refineCutWindow(fine);
+  eq(r.t, 1000, '细化定位到首个新镜头帧');
+  ok(r.score > 0.4, '细化返回变化强度');
+  eq(Core.refineCutWindow([{ t: 0, metrics: mRed }]), null, '样本不足返回 null');
+  eq(Core.refineCutWindow([]), null, '空样本返回 null');
+}
+
+// ---- 最近切点 ----
+const cutList = [{ time: 1600, strength: 0.8 }, { time: 3200, strength: 0.9 }];
+{
+  const hit = Core.nearestCut(cutList, 1700, 400);
+  eq(hit.time, 1600, '容差内取最近切点');
+  eq(hit.delta, -100, 'delta = 切点 − 目标');
+  eq(Core.nearestCut(cutList, 2400, 400), null, '容差外返回 null');
+  eq(Core.nearestCut(cutList, 3100, 400).time, 3200, '双向容差');
+}
+
+// ---- 字幕与切点冲突 ----
+{
+  const cuesX = [
+    { num: '1', start: 500, end: 2400, lines: ['横跨切点'] },     // 1600 在内部 → cross
+    { num: '2', start: 2850, end: 3000, lines: ['终点近切点'] },   // end 距 3200 为 200 → near-end
+    { num: '3', start: 3400, end: 5000, lines: ['起点近切点'] },   // start 距 3200 为 200 → near-start
+    { num: '4', start: 1600, end: 2000, lines: ['起点贴合'] },     // 恰好贴合 → 不报
+  ];
+  const probs = Core.analyzeCutConflicts(cuesX, cutList, 400);
+  eq(probs.length, 3, '检出 3 个切点问题（贴合的不报）');
+  eq(probs[0].type, 'cut-cross', '横跨切点类型');
+  eq(probs[0].cue, 0, '横跨问题关联第 1 条');
+  eq(probs[0].cutIdx, 0, '横跨问题关联切点 1600');
+  eq(probs[1].type, 'cut-near', '近切点类型');
+  eq(probs[1].edge, 'end', '终点接近');
+  eq(probs[2].edge, 'start', '起点接近');
+  eq(Core.analyzeCutConflicts(cuesX, cutList, 100).filter(p => p.type === 'cut-near').length, 0,
+    '容差收窄到 100ms 后近切点问题消失');
+  eq(Core.analyzeCutConflicts(cuesX, [], 400).length, 0, '无切点无问题');
+}
+
+// ---- 批量吸附计划 ----
+{
+  const cuesS = [
+    { num: '1', start: 1700, end: 2800, lines: ['a'] },   // start→1600
+    { num: '2', start: 2850, end: 3000, lines: ['b'] },   // end→3200 但与第 3 条 2950 起点重叠 → 排除
+    { num: '3', start: 2950, end: 5000, lines: ['c'] },   // start→3200（第 2 条被排除后仍用上一条原时间校验）
+    { num: '4', start: 6000, end: 7000, lines: ['d'] },   // 与切点无关
+  ];
+  const plan = Core.planCutSnap(cuesS, cutList, 400, { allowOverlap: false, minDurMs: 40 });
+  eq(plan.changes.length, 2, '两条可吸附');
+  eq(plan.changes[0].newStart, 1600, '第 1 条起点吸附到切点');
+  eq(plan.changes[0].snapStart, true, '标记起点吸附');
+  eq(plan.changes[0].snapEnd, false, '终点未吸附');
+  eq(plan.changes[1].i, 2, '第 3 条吸附');
+  eq(plan.changes[1].newStart, 3200, '第 3 条起点吸附');
+  eq(plan.skipped.length, 1, '第 2 条被排除');
+  ok(plan.skipped[0].reason.includes('重叠'), '排除原因：与下一条重叠');
+  eq(cuesS[0].start, 1700, 'planCutSnap 不修改输入');
+  // 允许重叠 → 第 2 条也可吸附
+  const planOv = Core.planCutSnap(cuesS, cutList, 400, { allowOverlap: true, minDurMs: 40 });
+  eq(planOv.changes.length, 3, '允许重叠时全部吸附');
+  // 贴合切点（delta 为 0）不产生变更
+  const aligned = [{ num: '1', start: 1600, end: 3200, lines: ['x'] }];
+  eq(Core.planCutSnap(aligned, cutList, 400, {}).changes.length, 0, '已贴合不重复吸附');
+  // 无效时长：起止都吸附到同一切点
+  const zero = [{ num: '1', start: 1500, end: 1700, lines: ['x'] }];
+  const planZero = Core.planCutSnap(zero, [{ time: 1600, strength: 1 }], 400, { minDurMs: 40 });
+  eq(planZero.changes.length, 0, '起止吸附到同一点被排除');
+  ok(planZero.skipped[0].reason.includes('时长无效'), '排除原因：无效时长');
+  // 负时间
+  const neg = [{ num: '1', start: 50, end: 900, lines: ['x'] }];
+  const planNeg = Core.planCutSnap(neg, [{ time: -100, strength: 1 }], 400, { minDurMs: 40 });
+  eq(planNeg.changes.length, 0, '负时间被排除');
+  ok(planNeg.skipped[0].reason.includes('负时间'), '排除原因：负时间');
+  // 倒序：起点吸附后越过下一条整体
+  const inv = [
+    { num: '1', start: 4800, end: 6000, lines: ['a'] },
+    { num: '2', start: 4100, end: 4400, lines: ['b'] },
+  ];
+  const planInv = Core.planCutSnap(inv, [{ time: 5000, strength: 1 }], 400, { allowOverlap: true, minDurMs: 40 });
+  eq(planInv.changes.length, 0, '越过下一条整体被排除（倒序）');
+  ok(planInv.skipped[0].reason.includes('倒序'), '排除原因：倒序');
+  // 顺序模拟：前一条吸附后的新终点参与后一条重叠校验
+  const seqC = [
+    { num: '1', start: 0, end: 1550, lines: ['a'] },     // end→1600
+    { num: '2', start: 1450, end: 2000, lines: ['b'] },  // start→1400 < 前条新终点 1600 → 重叠排除
+  ];
+  const cuts2 = [{ time: 1400, strength: 1 }, { time: 1600, strength: 1 }];
+  const planSeq = Core.planCutSnap(seqC, cuts2, 400, { allowOverlap: false, minDurMs: 40 });
+  eq(planSeq.changes.length, 1, '顺序模拟：仅第 1 条吸附');
+  eq(planSeq.skipped.length, 1, '第 2 条因与前条新终点重叠被排除');
+  ok(planSeq.skipped[0].reason.includes('上一条'), '排除原因指向上一条');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

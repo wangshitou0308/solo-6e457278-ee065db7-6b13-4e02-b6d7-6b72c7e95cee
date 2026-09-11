@@ -1347,6 +1347,175 @@
     return { cues: w, applied: applied, blocked: blocked };
   }
 
+  // ---------- 镜头切点检测（纯计算；取帧由 app.js 在浏览器中完成） ----------
+
+  // 单帧指标：亮度均值（0..255，Rec.709 加权）+ RGB 三通道归一化直方图。
+  // rgba：RGBA 像素数组（Uint8ClampedArray）；bins：每通道直方图桶数。
+  function frameMetrics(rgba, bins) {
+    bins = bins || 8;
+    var hist = new Array(bins * 3);
+    for (var k = 0; k < hist.length; k++) hist[k] = 0;
+    var lumSum = 0;
+    var n = Math.floor(rgba.length / 4);
+    for (var i = 0; i < n * 4; i += 4) {
+      var r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+      lumSum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      hist[Math.min(bins - 1, (r * bins) >> 8)]++;
+      hist[bins + Math.min(bins - 1, (g * bins) >> 8)]++;
+      hist[2 * bins + Math.min(bins - 1, (b * bins) >> 8)]++;
+    }
+    if (n > 0) {
+      for (var j = 0; j < hist.length; j++) hist[j] /= n;
+    }
+    return { lum: n ? lumSum / n : 0, hist: hist, bins: bins };
+  }
+
+  // 相邻帧变化强度 0..1：亮度差与直方图距离（1 − 三通道交集均值）的加权和
+  function metricsDelta(a, b, lumWeight) {
+    var w = lumWeight === undefined ? 0.45 : lumWeight;
+    var lumD = Math.abs(a.lum - b.lum) / 255;
+    var inter = 0;
+    for (var k = 0; k < a.hist.length; k++) inter += Math.min(a.hist[k], b.hist[k]);
+    var histD = 1 - inter / 3;
+    return w * lumD + (1 - w) * histD;
+  }
+
+  // 粗检测：samples 为按时间升序的 [{t, metrics}]，返回变化强度 ≥ threshold 的
+  // 候选切点 [{t, score, i}]（t/i 为相邻帧对中后一帧的时间与下标）。
+  // minGapMs 内只保留最强的一个（非极大值抑制），避免一次切换报多个候选。
+  function findCutCandidates(samples, threshold, minGapMs, lumWeight) {
+    var kept = [];
+    for (var i = 1; i < samples.length; i++) {
+      var score = metricsDelta(samples[i - 1].metrics, samples[i].metrics, lumWeight);
+      if (score < threshold) continue;
+      var cand = { t: samples[i].t, score: score, i: i };
+      var last = kept[kept.length - 1];
+      if (last && cand.t - last.t < minGapMs) {
+        if (cand.score > last.score) kept[kept.length - 1] = cand;
+      } else {
+        kept.push(cand);
+      }
+    }
+    return kept;
+  }
+
+  // 细化：在候选区间的细采样序列中定位变化最大的相邻帧对，
+  // 切点取后一帧时间；返回 {t, score}，样本不足时返回 null。
+  function refineCutWindow(fineSamples, lumWeight) {
+    if (!fineSamples || fineSamples.length < 2) return null;
+    var best = -1, bestScore = -1;
+    for (var i = 1; i < fineSamples.length; i++) {
+      var s = metricsDelta(fineSamples[i - 1].metrics, fineSamples[i].metrics, lumWeight);
+      if (s > bestScore) { bestScore = s; best = i; }
+    }
+    if (best < 0) return null;
+    return { t: fineSamples[best].t, score: bestScore };
+  }
+
+  // 距离 t 最近且 |cut - t| ≤ tolMs 的切点；cuts 为 [{time, strength}]。
+  // 返回 {idx, time, delta}（delta = cut.time − t），无命中返回 null。
+  function nearestCut(cuts, t, tolMs) {
+    var best = null;
+    for (var i = 0; i < cuts.length; i++) {
+      var d = cuts[i].time - t;
+      if (Math.abs(d) <= tolMs && (!best || Math.abs(d) < Math.abs(best.delta))) {
+        best = { idx: i, time: cuts[i].time, delta: d };
+      }
+    }
+    return best;
+  }
+
+  // 字幕与切点的冲突检查：
+  //   cut-cross  切点落在字幕内部，且距起止均超过容差（字幕横跨镜头切换）
+  //   cut-near   起点 / 终点距切点在 (0, tolMs] 内但未贴合（edge: 'start' | 'end'）
+  // 恰好贴合（delta 为 0）不报问题。返回 [{cue, type, edge, cutIdx, cutTime, delta, msg}]
+  function analyzeCutConflicts(cues, cuts, tolMs) {
+    var probs = [];
+    if (!cuts || !cuts.length) return probs;
+    cues.forEach(function (c, i) {
+      cuts.forEach(function (cut, ci) {
+        var t = cut.time;
+        var dStart = t - c.start, dEnd = t - c.end;
+        if (dStart !== 0 && Math.abs(dStart) <= tolMs) {
+          probs.push({
+            cue: i, type: 'cut-near', edge: 'start', cutIdx: ci, cutTime: t, delta: dStart,
+            msg: '起点距切点 ' + Math.abs(dStart) + 'ms 未贴合（切点 ' + fmtShort(t) + '）',
+          });
+        } else if (dEnd !== 0 && Math.abs(dEnd) <= tolMs) {
+          probs.push({
+            cue: i, type: 'cut-near', edge: 'end', cutIdx: ci, cutTime: t, delta: dEnd,
+            msg: '终点距切点 ' + Math.abs(dEnd) + 'ms 未贴合（切点 ' + fmtShort(t) + '）',
+          });
+        } else if (t > c.start && t < c.end) {
+          probs.push({
+            cue: i, type: 'cut-cross', cutIdx: ci, cutTime: t,
+            delta: 0,
+            msg: '字幕横跨镜头切点 ' + fmtShort(t) + '（可考虑拆分或调整边界）',
+          });
+        }
+      });
+    });
+    return probs;
+  }
+
+  // 批量吸附计划：把容差内未贴合的起点 / 终点吸附到最近切点，不修改原数据。
+  // 顺序模拟（前一条采用新时间后再校验后一条），逐项排除：
+  //   负时间、无效时长（end − start < minDurMs）、与邻条完全倒序、
+  //   以及规则不允许的重叠（opts.allowOverlap 为 false 时）。
+  // 返回 { changes:[{i,num,oldStart,oldEnd,newStart,newEnd,snapStart,snapEnd}],
+  //        skipped:[{i,num,reason}] }
+  function planCutSnap(cues, cuts, tolMs, opts) {
+    opts = opts || {};
+    var allowOverlap = !!opts.allowOverlap;
+    var minDur = opts.minDurMs === undefined ? 1 : opts.minDurMs;
+    var changes = [], skipped = [];
+    var proposed = cues.map(function (c) { return { start: c.start, end: c.end }; });
+    cues.forEach(function (c, i) {
+      var hitS = nearestCut(cuts, c.start, tolMs);
+      var hitE = nearestCut(cuts, c.end, tolMs);
+      var ns = hitS && hitS.delta !== 0 ? hitS.time : null;
+      var ne = hitE && hitE.delta !== 0 ? hitE.time : null;
+      if (ns === null && ne === null) return;   // 起止都与切点无关
+      var newStart = ns === null ? c.start : ns;
+      var newEnd = ne === null ? c.end : ne;
+      function skip(reason) {
+        skipped.push({ i: i, num: c.num || String(i + 1), reason: reason });
+      }
+      if (newStart < 0) {
+        return skip('吸附后出现负时间（' + fmtMs(newStart, 'srt') + '）');
+      }
+      if (!(newEnd - newStart >= minDur)) {
+        return skip('吸附后时长无效（' + (newEnd - newStart) + 'ms，不足 ' + minDur + 'ms）');
+      }
+      if (i > 0 && newEnd <= proposed[i - 1].start) {
+        return skip('吸附后与上一条倒序（终点不晚于上一条起点 ' +
+          fmtMs(proposed[i - 1].start, 'srt') + '）');
+      }
+      if (i + 1 < cues.length && newStart >= cues[i + 1].end) {
+        return skip('吸附后与下一条倒序（起点不早于下一条终点 ' +
+          fmtMs(cues[i + 1].end, 'srt') + '）');
+      }
+      if (!allowOverlap) {
+        if (i > 0 && newStart < proposed[i - 1].end) {
+          return skip('吸附后与上一条重叠（上一条终点 ' + fmtMs(proposed[i - 1].end, 'srt') +
+            '，规则不允许重叠）');
+        }
+        if (i + 1 < cues.length && newEnd > cues[i + 1].start) {
+          return skip('吸附后与下一条重叠（下一条起点 ' + fmtMs(cues[i + 1].start, 'srt') +
+            '，规则不允许重叠）');
+        }
+      }
+      proposed[i] = { start: newStart, end: newEnd };
+      changes.push({
+        i: i, num: c.num || String(i + 1),
+        oldStart: c.start, oldEnd: c.end,
+        newStart: newStart, newEnd: newEnd,
+        snapStart: ns !== null, snapEnd: ne !== null,
+      });
+    });
+    return { changes: changes, skipped: skipped };
+  }
+
   // ---------- 草稿键 ----------
 
   // FNV-1a 简易哈希，用于生成草稿键
@@ -1379,6 +1548,11 @@
     adoptText: adoptText, adoptTime: adoptTime, adoptFull: adoptFull,
     replaceGroup: replaceGroup, insertOnlyB: insertOnlyB, deleteOnlyA: deleteOnlyA,
     entryActionErrors: entryActionErrors, planMerge: planMerge,
+    // 镜头切点检测
+    frameMetrics: frameMetrics, metricsDelta: metricsDelta,
+    findCutCandidates: findCutCandidates, refineCutWindow: refineCutWindow,
+    nearestCut: nearestCut, analyzeCutConflicts: analyzeCutConflicts,
+    planCutSnap: planCutSnap,
     simpleHash: simpleHash, draftKey: draftKey,
   };
 });

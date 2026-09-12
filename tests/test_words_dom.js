@@ -272,7 +272,103 @@ const tick = () => new Promise(r => setTimeout(r, 20));
   wordRulerSeek(Math.round((span1.start + span1.end) / 2));
   await tick();
   ok(/vtt-voice/.test(doc.getElementById('nowCueText').innerHTML), '<v> 说话人标签在预览中保留');
+
+  console.log('10. 错误列表：具体类型 + 点击定位到准确文本位置');
+  {
+    const badVtt = ['WEBVTT', '',
+      'c1', '00:00:01.000 --> 00:00:04.000',
+      '甲<00:00:02.000>乙<00:00:01.500>丙<00:00:09.000>丁 <00:99.00>戊', ''].join('\n');
+    const Core = window.SubCore;
+    const cues = Core.parseSubtitle(badVtt).cues;
+    const problems = Core.analyzeWordTimings(cues);
+    const kinds = problems.map(p => p.kind);
+    ok(kinds.includes('order') && kinds.includes('outrange') && kinds.includes('badtime'),
+      '三类错误齐全：' + kinds.join(','));
+    ok(problems.every(p => p.type === 'wordtime' && Number.isInteger(p.tagTok)),
+      '错误带 type 与 tagTok');
+    // 用真实界面路径：把坏 VTT 载入后检查问题徽章与点击选中
+    window.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({ filename: 'bad.vtt', content: badVtt }) });
+    click(doc.getElementById('btnSampleVtt'));
+    await tick(); await tick();
+    const badgeTexts = [...doc.querySelectorAll('#problemList .badge')].map(b => b.textContent);
+    ok(!badgeTexts.some(t => /undefined/.test(t)), '徽章无 undefined：' + badgeTexts.join('|'));
+    ok(badgeTexts.some(t => /倒序/.test(t)) && badgeTexts.some(t => /越界/.test(t)) &&
+      badgeTexts.some(t => /格式/.test(t)), '徽章显示具体子类型');
+    const liOrder = [...doc.querySelectorAll('#problemList li')].find(li => /未严格递增/.test(li.textContent));
+    liOrder.click();
+    await tick();
+    const ta = doc.querySelector('#cueTbody tr.selected textarea');
+    ok(ta && ta.value.slice(ta.selectionStart, ta.selectionEnd) === '<00:00:01.500>',
+      '点击倒序问题选中出错时间戳：' + (ta ? ta.value.slice(ta.selectionStart, ta.selectionEnd) : 'no ta'));
+    ok(!doc.getElementById('wordPanel').classList.contains('hidden'), '定位时展开词元轨道');
+  }
+
   ok(errs.length === 0, 'jsdom 无错误事件' + (errs.length ? '：' + errs.join(' | ') : ''));
+
+  console.log('11. 拖动边缘后取消：区间与词元恢复到拖动前');
+  {
+    const cv = doc.getElementById('timeline');
+    // 重新载入带标记的干净 VTT
+    window.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({
+      filename: 'm.vtt',
+      content: ['WEBVTT', '', 'c1', '00:00:01.000 --> 00:00:05.000',
+        '甲<00:00:02.000>乙<00:00:04.000>丙', ''].join('\n'),
+    }) });
+    click(doc.getElementById('btnSampleVtt'));
+    await tick(); await tick();
+    const v = window.__dbgView();
+    const tx = (t) => (t - v.startMs) * v.pxPerMs;
+    const row0 = rows()[0];
+    const ta = () => rows()[0].querySelector('textarea');
+    const endInp = () => rows()[0].querySelector('input[data-field="end"]');
+    // 拖右边缘到 6s
+    const cv2 = doc.getElementById('timeline');
+    cv2.dispatchEvent(new window.MouseEvent('mousedown', { clientX: tx(5000) - 3, clientY: 80, button: 0, bubbles: true }));
+    window.dispatchEvent(new window.MouseEvent('mousemove', { clientX: tx(6000) - 3, clientY: 80, bubbles: true }));
+    await tick();
+    window.dispatchEvent(new window.MouseEvent('mouseup', { clientX: tx(6000) - 3, clientY: 80, button: 0, bubbles: true }));
+    await tick();
+    ok(!doc.getElementById('wordBoundsModal').classList.contains('hidden'), '含标记时拖边弹出方案');
+    ok(endInp().value === '00:00:06,000', '拖动中区间临时变为 6s：' + endInp().value);
+    click(doc.getElementById('btnWbCancel'));
+    await tick();
+    ok(endInp().value === '00:00:05,000', '取消后终点恢复 5s：' + endInp().value);
+    ok(ta().value === '甲<00:00:02.000>乙<00:00:04.000>丙', '取消后词元文本恢复：' + ta().value);
+    ok(![...doc.querySelectorAll('#problemList .badge')].some(b => /越界/.test(b.textContent)),
+      '取消后无新增越界问题');
+  }
+
+  console.log('12. 整块拖动：词元只按总增量平移一次，编辑区/模型一致');
+  {
+    const v = window.__dbgView();
+    const tx = (t) => (t - v.startMs) * v.pxPerMs;
+    const ta = () => rows()[0].querySelector('textarea');
+    const startInp = () => rows()[0].querySelector('input[data-field="start"]');
+    const cv2 = doc.getElementById('timeline');
+    const before = ta().value;
+    // 块中部按下，连续两次 mousemove（+100ms、+300ms）
+    cv2.dispatchEvent(new window.MouseEvent('mousedown', { clientX: tx(3000), clientY: 80, button: 0, bubbles: true }));
+    window.dispatchEvent(new window.MouseEvent('mousemove', { clientX: tx(3100), clientY: 80, bubbles: true }));
+    await tick();
+    window.dispatchEvent(new window.MouseEvent('mousemove', { clientX: tx(3300), clientY: 80, bubbles: true }));
+    await tick();
+    window.dispatchEvent(new window.MouseEvent('mouseup', { clientX: tx(3300), clientY: 80, button: 0, bubbles: true }));
+    await tick();
+    ok(startInp().value === '00:00:01,300', '区间整体 +300ms：' + startInp().value);
+    const after = ta().value;
+    ok(after === '甲<00:00:02.300>乙<00:00:04.300>丙', '词元仅按总增量 +300ms：' + after);
+    ok(JSON.stringify(after.split('\n')) === JSON.stringify(window.__dbgCueLines(0)),
+      '编辑区与模型为同一份文本');
+    // 导出 VTT 应与编辑区一致
+    let captured = null;
+    const OrigBlob = window.Blob;
+    window.Blob = class extends OrigBlob { constructor(parts, o) { super(parts, o); this.t = parts.join(''); } };
+    window.URL.createObjectURL = (b) => { captured = b; return 'blob:x'; };
+    doc.getElementById('exportFormat').value = 'vtt';
+    click(doc.getElementById('btnExport'));
+    ok(captured.t.includes(after), 'WebVTT 导出使用同一组时间');
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })().catch(e => { console.error('异常：', e); process.exit(1); });

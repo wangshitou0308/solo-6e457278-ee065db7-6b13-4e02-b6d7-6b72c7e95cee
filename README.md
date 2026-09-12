@@ -10,7 +10,9 @@ python3 server.py        # 默认端口 8000
 python3 server.py 9000   # 指定端口
 ```
 
-然后浏览器打开 <http://127.0.0.1:8000/>。首次启动自动载入内置示例字幕。
+然后浏览器打开 <http://127.0.0.1:8000/>。首次启动自动载入内置示例字幕；
+顶栏「VTT 逐词示例」载入带内联时间戳的 WebVTT（含 `<v>` / `<c>` / `<ruby>` / 实体），
+无需媒体即可体验词元轨道。
 
 ## 功能
 
@@ -47,11 +49,26 @@ python3 server.py 9000   # 指定端口
 - **键盘微调**：`←`/`→` 整体平移；`[` `]` 调起点；`;` `'` 调终点；
   步进 100ms，`Shift` 500ms，`Alt` 10ms；`↑`/`↓` 切换选中行。
 - **文本搜索**：`Ctrl+F`，命中行高亮，回车跳转下一个（`Shift+Enter` 上一个）。
+- **WebVTT 逐词时间码（词元轨道）**：
+  - 导入时解析 cue 内联时间戳（如 `<v 小明>欢迎<00:00:01.200>来到</v>`），
+    保留 `<v>` / `<c>` / `<ruby>` / `<i>` 等标签与 `&amp;` 等实体；SRT 同样可编辑。
+  - 选中字幕即在时间轴下展开**词元轨道**：每个不可拆单元（汉字、英文单词、
+    数字串、实体）一块；播放（含无媒体的模拟播放头）时按 `M` 依次把当前时间
+    标记为下一词元起点，也可拖动轨道竖线或点词元输入时间。
+  - 标记必须**严格递增且位于 cue 区间内**；标签、实体、英文单词与数字串绝不拆开，
+    违反时拒绝并说明原因，不擅自修正。
+  - 导入的**格式错误 / 顺序倒置 / 超出 cue 区间**进入右侧问题面板（显示具体子类型），
+    点击即选中该字幕、展开轨道、在文本框选中出错时间戳并高亮对应词元。
+  - 改动 cue 起止时弹窗比较 **保持绝对时间** 与 **按比例缩放** 两方案，
+    会越界 / 失去递增性的方案禁用并说明原因；整块拖动则词元随之平移（仅按总增量一次）。
+  - 预览区（媒体条与视频叠加层）随播放头高亮当前词元；未载入媒体也能手工编辑。
+  - 逐词标记纳入撤销/重做、草稿与搜索（时间戳不干扰正文匹配）；
+    **逐词时间码只写入 WebVTT 导出**，SRT 导出自动剥去时间戳标签（其余标签与实体保留）。
 - **本地草稿**：每次修改自动保存到后端 sqlite3（`drafts.db`，按文件内容哈希区分）；
   重新导入同一文件时提示恢复，导出后自动清除。
   刷新页面只恢复字幕编辑状态，媒体文件不会保存，会提示重新选择。
 - **导出**：保留文本换行与 WebVTT 头部 / cue 设置，可导出为原格式 / SRT / VTT；
-  拆分、合并后 SRT 序号按顺序重排，VTT 显式标识符原样保留。
+  拆分、合并后 SRT 序号按顺序重排，VTT 显式标识符原样保留；逐词时间码仅随 VTT 导出。
 
 ## 目录结构
 
@@ -59,18 +76,21 @@ python3 server.py 9000   # 指定端口
 server.py          # 后端：静态文件 + /api/sample + /api/draft（sqlite3）
 static/index.html  # 页面结构
 static/style.css   # 深色主题样式
-static/core.js     # 纯逻辑：解析/序列化/分析/自动顺延/双锚点/拆分/合并/智能分行（浏览器与 Node 通用）
-static/app.js      # 界面交互：时间轴、拖拽、撤销重做、搜索、草稿、导出、媒体对照、断句分行
+static/core.js     # 纯逻辑：解析/序列化/分析/自动顺延/双锚点/拆分/合并/智能分行/逐词时间码（浏览器与 Node 通用）
+static/app.js      # 界面交互：时间轴、拖拽、撤销重做、搜索、草稿、导出、媒体对照、断句分行、词元轨道
 tests/test_core.js # 核心逻辑单元测试（Node）
 tests/test_dom.js  # DOM 集成测试（可选，需 jsdom：npm install --no-save jsdom）
+tests/test_words_dom.js # 逐词时间码 DOM 集成测试（可选，需 jsdom）
+tests/test_compare_dom.js # 版本对照 DOM 集成测试（可选，需 jsdom）
 tests/e2e.js       # 浏览器端到端测试（可选，需 playwright-core + Chromium）
 ```
 
 ## 测试
 
 ```bash
-node tests/test_core.js   # 核心逻辑单元测试
-node tests/test_dom.js    # DOM 集成测试（未装 jsdom 时自动跳过）
+node tests/test_core.js       # 核心逻辑单元测试
+node tests/test_dom.js        # DOM 集成测试（未装 jsdom 时自动跳过）
+node tests/test_words_dom.js  # 逐词时间码 DOM 集成测试
 python3 -m py_compile server.py
 ```
 
@@ -81,7 +101,8 @@ python3 -m py_compile server.py
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/sample` | 内置示例字幕 |
+| GET | `/api/sample` | 内置 SRT 示例字幕 |
+| GET | `/api/sample?kind=vtt` | 内置 WebVTT 逐词时间码示例 |
 | GET | `/api/draft?key=` | 查询草稿 |
 | POST | `/api/draft` | 保存草稿 `{key, filename, format, content}` |
 | DELETE | `/api/draft?key=` | 删除草稿 |

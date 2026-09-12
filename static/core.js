@@ -1588,7 +1588,8 @@
         if (/^[\d\s:.,]+$/.test(inner) && /\d/.test(inner) && !TS_OPEN.test(t.s)) {
           var p1 = lineCol(t.off);
           errors.push({
-            kind: 'badtime', msg: '时间戳格式错误「' + t.s + '」（第 ' + p1.line + ' 行第 ' + p1.col +
+            type: 'wordtime', kind: 'badtime', tagTok: i,
+            msg: '时间戳格式错误「' + t.s + '」（第 ' + p1.line + ' 行第 ' + p1.col +
               ' 字），应为 <HH:MM:SS.mmm>，未擅自修改',
             off: t.off, len: t.s.length, line: p1.line, col: p1.col,
           });
@@ -1599,7 +1600,8 @@
       if (tm === null) {
         var p2 = lineCol(t.off);
         errors.push({
-          kind: 'badtime', msg: '时间戳格式错误「' + t.s + '」（第 ' + p2.line + ' 行第 ' + p2.col + ' 字）',
+          type: 'wordtime', kind: 'badtime', tagTok: i,
+          msg: '时间戳格式错误「' + t.s + '」（第 ' + p2.line + ' 行第 ' + p2.col + ' 字）',
           off: t.off, len: t.s.length, line: p2.line, col: p2.col,
         });
         continue;
@@ -1607,18 +1609,20 @@
       if (lastTime !== null && tm <= lastTime) {
         var p3 = lineCol(t.off);
         errors.push({
-          kind: 'order', msg: '时间戳 ' + fmtMs(tm, 'srt') + ' 未严格递增（不晚于上一个 ' +
+          type: 'wordtime', kind: 'order', tagTok: i, time: tm, prev: lastTime,
+          msg: '时间戳 ' + fmtMs(tm, 'srt') + ' 未严格递增（不晚于上一个 ' +
             fmtMs(lastTime, 'srt') + '，第 ' + p3.line + ' 行第 ' + p3.col + ' 字），未擅自调整',
-          off: t.off, len: t.s.length, line: p3.line, col: p3.col, time: tm, prev: lastTime,
+          off: t.off, len: t.s.length, line: p3.line, col: p3.col,
         });
       }
       if (tm < cue.start || tm > cue.end) {
         var p4 = lineCol(t.off);
         errors.push({
-          kind: 'outrange', msg: '时间戳 ' + fmtMs(tm, 'srt') + ' 超出该字幕区间 ' +
+          type: 'wordtime', kind: 'outrange', tagTok: i, time: tm,
+          msg: '时间戳 ' + fmtMs(tm, 'srt') + ' 超出该字幕区间 ' +
             fmtMs(cue.start, 'srt') + ' ~ ' + fmtMs(cue.end, 'srt') +
             '（第 ' + p4.line + ' 行第 ' + p4.col + ' 字），未擅自调整',
-          off: t.off, len: t.s.length, line: p4.line, col: p4.col, time: tm,
+          off: t.off, len: t.s.length, line: p4.line, col: p4.col,
         });
       }
       // 找它后面的第一个正文单元（标签 / 空白不附时间戳；遇到下一个时间戳即停止）
@@ -1639,13 +1643,18 @@
     return { toks: toks, marks: marks, errors: errors };
   }
 
-  // 全文档逐词时间戳校验，返回带 cue 下标准备给界面定位的错误列表
+  // 全文档逐词时间戳校验，返回带 cue 下标准备给界面定位的错误列表。
+  // 每条错误含 type:'wordtime'、kind（badtime/order/outrange）、
+  // tagTok（出错时间戳标签的 token 下标）与行列 / 偏移，供界面精确定位。
   function analyzeWordTimings(cues) {
     var out = [];
     cues.forEach(function (c, i) {
       parseCueWords(c).errors.forEach(function (e) {
-        out.push({ cue: i, kind: e.kind, msg: e.msg, off: e.off, len: e.len,
-          line: e.line, col: e.col });
+        out.push({
+          cue: i, type: 'wordtime', kind: e.kind, tagTok: e.tagTok,
+          msg: e.msg, off: e.off, len: e.len, line: e.line, col: e.col,
+          time: e.time,
+        });
       });
     });
     return out;

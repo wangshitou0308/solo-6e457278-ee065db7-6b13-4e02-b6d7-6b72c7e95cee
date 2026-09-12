@@ -706,21 +706,26 @@
     var frag = document.createDocumentFragment();
     state.problems.forEach(function (p) {
       var cue = state.doc.cues[p.cue];
+      var label = TYPE_LABEL[p.type] || p.type;
+      if (p.type === 'wordtime') {
+        label = { badtime: '时间戳格式', order: '时间戳倒序', outrange: '时间戳越界' }[p.kind] || label;
+      }
       var li = document.createElement('li');
       li.innerHTML =
-        '<span class="badge ' + p.type + '">' + (TYPE_LABEL[p.type] || p.type) + '</span>' +
+        '<span class="badge ' + p.type + ' word-' + (p.kind || '') + '">' + esc(label) + '</span>' +
         '<span class="p-num">#' + esc(cue.num) + '</span>' +
         '<span class="p-msg">' + esc(p.msg) +
         '<span class="p-text">' + esc(cue.lines.join(' / ')) + '</span></span>';
       li.addEventListener('click', function () {
-        selectCue(p.cue, { center: true, scroll: true });
         if (p.type === 'cut-cross' || p.type === 'cut-near') {
-          // 切点问题：展示切点前后缩略图并同步定位媒体
+          // 切点问题：先选中，再展示切点前后缩略图并同步定位媒体
+          selectCue(p.cue, { center: true, scroll: true });
           openCutDetail(p.cue, p.cutIdx);
         } else if (p.type === 'wordtime') {
-          // 逐词时间戳错误：展开词元轨道并定位到具体行列
+          // 逐词时间戳错误：选中、展开词元轨道、选中文本并高亮出错标记
           locateWordError(p);
         } else {
+          selectCue(p.cue, { center: true, scroll: true });
           setStatus('定位到第 ' + cue.num + ' 条');
         }
       });
@@ -962,7 +967,10 @@
       selectCue(hit.idx, {});
       drag = {
         mode: hit.mode, idx: hit.idx, startX: x,
-        origStart: cue.start, origEnd: cue.end, moved: false,
+        origStart: cue.start, origEnd: cue.end,
+        // 整块移动时词元以拖动前文本为基准，只按最终增量平移一次
+        origLines: cue.lines.slice(),
+        moved: false,
       };
     } else {
       drag = { mode: 'pan', startX: x, viewStart: state.view.startMs, moved: false };
@@ -992,16 +1000,21 @@
     if (drag.mode === 'move') {
       var dur = drag.origEnd - drag.origStart;
       var ns = Math.max(0, drag.origStart + dt);
+      // 每次都从拖动前的原始文本出发，按“总增量”平移一次，避免连续 mousemove 累加
+      cue.lines = drag.origLines.slice();
       cue.start = ns;
       cue.end = ns + dur;
-      // 整块平移：词元标记随之平移（保持相对节奏），越界则回退并提示
-      var tr = C.translateWordTimes(cue, ns - drag.origStart,
+      var tr = C.translateWordTimes(
+        { start: drag.origStart, end: drag.origEnd, lines: cue.lines },
+        ns - drag.origStart,
         { start: cue.start, end: cue.end });
       if (!tr.error) {
         cue.lines = tr.lines;
-        drag.wordTranslated = true;
       } else {
-        cue.start = drag.origStart; cue.end = drag.origEnd;
+        // 无法平移（平移后会越界）：回退到拖动前，本帧不更新
+        cue.start = drag.origStart;
+        cue.end = drag.origEnd;
+        cue.lines = drag.origLines.slice();
         setStatus('无法继续平移：' + tr.error);
         drag.moved = false;
         return;
@@ -1012,10 +1025,19 @@
       cue.end = Math.max(drag.origEnd + dt, cue.start + MIN_DUR);
     }
     fillRowTimes(drag.idx);
+    // 拖动过程中编辑区 / 预览与模型保持同一份时间与文本
+    syncRowTextarea(drag.idx);
     analyzeAndRender();
     drawCanvas();
     refreshWordPanelLive();
   });
+
+  // 把第 i 条 textarea 同步为当前模型文本（拖动期间输入框未失焦，change 不会触发）
+  function syncRowTextarea(i) {
+    var ta = rowEls[i] && rowEls[i].querySelector('textarea');
+    var cue = state.doc && state.doc.cues[i];
+    if (ta && cue) ta.value = cue.lines.join('\n');
+  }
 
   window.addEventListener('mouseup', function () {
     if (!drag) return;
@@ -1027,12 +1049,15 @@
     var changedBounds = d.mode !== 'move' &&
       (cue.start !== d.origStart || cue.end !== d.origEnd);
     if (changedBounds && cueHasWordMarks(cue)) {
-      // 起止被拖动且含词元标记：弹出两方案选择；取消则整体回退（含撤销栈）
+      // 起止被拖动且含词元标记：弹出两方案选择；取消则由弹窗恢复 d.origLines 等
       requestBoundsChange(d.idx, cue.start, cue.end, {
         label: 'drag', alreadyMutated: true,
-        orig: { start: d.origStart, end: d.origEnd },
+        orig: { start: d.origStart, end: d.origEnd, lines: d.origLines },
       });
     } else {
+      // 整块移动 / 无标记改边：编辑区、预览、导出统一到当前模型
+      renderList();
+      selectCue(d.idx, { scroll: false });
       afterChange('已调整第 ' + cue.num + ' 条：' +
         C.fmtMs(cue.start, 'srt') + ' → ' + C.fmtMs(cue.end, 'srt'));
     }
@@ -3261,6 +3286,14 @@
     return c ? { start: c.start, end: c.end } : null;
   };
   window.__dbgPlayhead = function () { return state.playheadMs; };
+  window.__dbgView = function () {
+    return { startMs: state.view.startMs, pxPerMs: state.view.pxPerMs };
+  };
+  window.__dbgCueLines = function (i) {
+    if (!state.doc) return null;
+    var k = (i === undefined || i === null) ? state.selected : i;
+    return state.doc.cues[k] ? state.doc.cues[k].lines.slice() : null;
+  };
   function cueHasWordMarks(cue) {
     if (!cue) return false;
     return C.parseCueWords(cue).marks.length > 0;
@@ -3298,15 +3331,46 @@
   // 词元 chips：每个不可拆正文单元一块；已标记显示起点时间
   function renderWordChips(cue, w) {
     wordChips.innerHTML = '';
-    var errOffs = {};
-    w.errors.forEach(function (e) { errOffs[e.off] = e; });
+    // 出错时间戳标签下标 → 错误；以及正文偏移 → 错误
+    var errByTag = {}, errByOff = {};
+    w.errors.forEach(function (e) {
+      if (e.tagTok !== undefined) errByTag[e.tagTok] = e;
+      errByOff[e.off] = e;
+    });
     var markByTok = {};
-    w.marks.forEach(function (m) { markByTok[m.tok] = m; });
+    // 时间戳标签下标 → 它后面的正文 token（order/outrange 错误高亮到该词元）
+    var tsTargetTok = {};
+    w.marks.forEach(function (m) {
+      markByTok[m.tok] = m;
+      tsTargetTok[m.tagTok] = m.tok;
+    });
+    // 未形成 mark（时间戳后无正文，如行尾）也建立目标映射，供错误定位
+    w.toks.forEach(function (t, i) {
+      if (t.type !== 'ts') return;
+      if (tsTargetTok[i] === undefined) {
+        for (var j = i + 1; j < w.toks.length; j++) {
+          if (w.toks[j].type === 'ts') break;
+          if (C.isContentTok(w.toks[j])) { tsTargetTok[i] = j; break; }
+        }
+      }
+    });
     var activeTok = state.playheadMs !== undefined ? C.activeWord(cue, state.playheadMs) : -1;
     var frag = document.createDocumentFragment();
-    var prevContentLine = -1;
     w.toks.forEach(function (t, i) {
-      if (t.type === 'ts') return;
+      if (t.type === 'ts') {
+        // 合法时间戳默认不显示；它若带 order/outrange 错误，渲染为红色标记
+        var terr = errByTag[i];
+        if (terr) {
+          var tb = document.createElement('span');
+          tb.className = 'wc-tsbad';
+          tb.textContent = t.s;
+          tb.title = terr.msg;
+          tb.dataset.tagtok = i;
+          tb.dataset.off = t.off;
+          frag.appendChild(tb);
+        }
+        return;
+      }
       if (t.type === 'space') {
         if (t.s.indexOf('\n') !== -1) frag.appendChild(document.createElement('br'));
         else {
@@ -3318,10 +3382,13 @@
         return;
       }
       if (t.type === 'tag') {
+        // 形似时间戳的坏标签：errByTag[i] 命中时显示为红色
+        var tagErr = errByTag[i];
         var tag = document.createElement('span');
-        tag.className = 'wc-tag';
+        tag.className = 'wc-tag' + (tagErr ? ' wc-tag-err' : '');
         tag.textContent = t.s;
-        tag.title = '标签（不可标记，导出时保留）';
+        tag.title = tagErr ? tagErr.msg : '标签（不可标记，导出时保留）';
+        if (tagErr) { tag.dataset.tagtok = i; tag.dataset.off = t.off; }
         frag.appendChild(tag);
         return;
       }
@@ -3332,6 +3399,7 @@
         (markByTok[i] ? ' marked' : '') +
         (i === activeTok ? ' active' : '');
       chip.dataset.tok = i;
+      chip.dataset.off = t.off;
       var label = t.type === 'entity' ? C.decodeEntity(t.s) : t.s;
       chip.textContent = label;
       var mk = markByTok[i];
@@ -3340,15 +3408,24 @@
         tm.className = 'wc-time mono';
         tm.textContent = C.fmtShort(mk.time);
         chip.appendChild(tm);
-      }
-      var err = errOffs[t.off];
-      if (err) {
-        chip.classList.add('wc-err');
-        chip.title = err.msg;
-      } else if (mk) {
-        chip.title = '词元起点 ' + C.fmtMs(mk.time, 'srt') + '（点击输入时间，可清除）';
+        // 该词元的时间戳若有 order/outrange 错误，红框提示
+        var mkTagErr = errByTag[mk.tagTok];
+        if (mkTagErr) {
+          chip.classList.add('wc-err');
+          chip.title = mkTagErr.msg;
+          chip.dataset.tagtok = mk.tagTok;
+        } else {
+          chip.title = '词元起点 ' + C.fmtMs(mk.time, 'srt') + '（点击输入时间，可清除）';
+        }
       } else {
-        chip.title = '点击输入起点时间；播放时按 M 顺序标记';
+        var err = errByOff[t.off];
+        if (err) {
+          chip.classList.add('wc-err');
+          chip.title = err.msg;
+          if (err.tagTok !== undefined) chip.dataset.tagtok = err.tagTok;
+        } else {
+          chip.title = '点击输入起点时间；播放时按 M 顺序标记';
+        }
       }
       frag.appendChild(chip);
     });
@@ -3664,11 +3741,12 @@
       afterChange(null);
       return true;
     }
-    // 记录“原始 cue 快照”（弹窗取消时 alreadyMutated 需要恢复）
-    var origCue = JSON.parse(JSON.stringify(cue));
-    var baseCue = opts.alreadyMutated && opts.orig
-      ? { start: opts.orig.start, end: opts.orig.end, lines: cue.lines }
-      : { start: cue.start, end: cue.end, lines: cue.lines };
+    // 原始 cue 快照必须在任何临时改动之前取得（拖拽时模型已被改成新区间）
+    var origCue = opts.alreadyMutated && opts.orig
+      ? { start: opts.orig.start, end: opts.orig.end, lines: (opts.orig.lines || cue.lines).slice() }
+      : { start: cue.start, end: cue.end, lines: cue.lines.slice() };
+    // 方案计算始终以“拖动前的区间与词元文本”为基准
+    var baseCue = { start: origCue.start, end: origCue.end, lines: origCue.lines.slice() };
     var plan = C.planWordBounds(baseCue, ns, ne);
     // 键盘整体平移：绝对时间随区间平移后仍合法则直接平移，不打断操作
     if (opts.translate) {
@@ -3742,21 +3820,29 @@
   function hideWordBounds(apply) {
     var pb = state.word.pendingBounds;
     if (pb && !apply && pb.opts && pb.opts.alreadyMutated) {
-      // 拖拽产生的临时改动被取消：恢复拖拽前 cue，并撤回拖拽开始时压入的空快照
+      // 拖拽产生的临时改动被取消：区间与词元文本一并恢复到拖动前，
+      // 并弹出拖拽开始时压入的撤销快照，保证“取消=完全未发生”
       var cue = state.doc.cues[pb.i];
       cue.start = pb.origCue.start;
       cue.end = pb.origCue.end;
-      cue.lines = pb.origCue.lines;
+      cue.lines = pb.origCue.lines.slice();
       if (state.undoStack.length) {
         state.undoStack.pop();
         updateUndoButtons();
       }
+      state.word.pendingBounds = null;
+      wordBoundsModal.classList.add('hidden');
       renderList();
       selectCue(pb.i, { scroll: false });
       afterChange(null);
-    } else if (pb && !apply && pb.i !== undefined) {
-      // 时间框输入 / 吸附等来源：模型从未改变，仅还原输入框显示
-      fillRowTimes(pb.i);
+      setStatus('已取消：区间与词元均恢复到拖动前');
+      return;
+    }
+    if (pb && !apply && pb.i !== undefined) {
+      // 时间框输入 / 吸附等来源：模型从未改变，但输入框可能显示着用户键入的目标值，
+      // 整体重渲染列表以恢复显示
+      renderList();
+      selectCue(pb.i, { scroll: false });
     }
     state.word.pendingBounds = null;
     wordBoundsModal.classList.add('hidden');
@@ -3779,8 +3865,8 @@
     var res;
     if (mode === 'absolute') {
       if (!pb.plan.absolute.ok) { setStatus('保持绝对时间会越界，该方案不可应用'); return; }
-      // 区间改变、词元文本不动
-      res = { lines: cue.lines };
+      // 区间改变、词元文本不动（统一以拖动前文本为基准）
+      res = { lines: pb.baseCue.lines.slice() };
     } else {
       res = C.scaleWordTimes(pb.baseCue, pb.ns, pb.ne);
       if (res.error) { setStatus('按比例缩放不可应用：' + res.error); return; }
@@ -3801,24 +3887,40 @@
   // ---------- 错误定位 ----------
   function locateWordError(p) {
     var cue = state.doc.cues[p.cue];
+    // 先选中该字幕并展开词元轨道（selectCue 会 renderWordPanel）
+    selectCue(p.cue, { center: true, scroll: true });
     setStatus('第 ' + cue.num + ' 条 ' + p.msg);
-    // 在文本框中定位到行列位置
+    // 1) 在文本框中精确选中出错的时间戳文本（行列 → 偏移）
     var ta = rowEls[p.cue] && rowEls[p.cue].querySelector('textarea');
-    if (ta && p.line !== undefined) {
-      var lines = ta.value.split('\n');
-      var pos = 0;
-      for (var k = 0; k < p.line - 1 && k < lines.length; k++) pos += lines[k].length + 1;
+    if (ta) {
+      var raw = ta.value;
+      var pos = 0, line = 1;
+      while (pos < raw.length && line < p.line) {
+        if (raw.charCodeAt(pos) === 10) line++;
+        pos++;
+      }
       pos += Math.max(0, p.col - 1);
+      var end = Math.min(raw.length, pos + (p.len || 1));
       ta.focus();
-      ta.setSelectionRange(pos, Math.min(ta.value.length, pos + (p.len || 1)));
+      ta.setSelectionRange(pos, end);
     }
-    renderWordPanel();
-    // 高亮出错 chip
+    // 2) 在词元轨道上高亮出错标记 / 时间戳（renderWordPanel 已重建 chips）
     setTimeout(function () {
-      var bad = wordChips.querySelector('.wc-err');
-      if (bad) {
-        bad.classList.add('flash');
-        bad.scrollIntoView({ block: 'nearest', inline: 'center' });
+      var sel = null;
+      if (p.tagTok !== undefined) {
+        sel = wordChips.querySelector('.wc-chip[data-tagtok="' + p.tagTok + '"]') ||
+          wordChips.querySelector('.wc-tsbad[data-tagtok="' + p.tagTok + '"]');
+      }
+      if (!sel) {
+        // 兜底：按文本偏移匹配
+        var chips = wordChips.querySelectorAll('.wc-chip[data-off], .wc-tsbad[data-off]');
+        for (var i = 0; i < chips.length; i++) {
+          if (+chips[i].dataset.off === p.off) { sel = chips[i]; break; }
+        }
+      }
+      if (sel) {
+        sel.classList.add('flash');
+        sel.scrollIntoView({ block: 'nearest', inline: 'center' });
       }
     }, 0);
   }

@@ -226,6 +226,23 @@ button.mini { padding: 1px 8px; font-size: 12px; }
   padding: 0 4px;
   white-space: nowrap;
 }
+#wordChips .wc-tag.wc-tag-err,
+#wordChips .wc-tsbad {
+  color: var(--bad);
+  background: #3a1d22;
+  border: 1px solid var(--bad);
+  cursor: pointer;
+}
+#wordChips .wc-tsbad {
+  font-family: var(--mono);
+  font-size: 11px;
+  border-radius: 4px;
+  padding: 0 4px;
+  white-space: nowrap;
+}
+.badge.word-badtime { background: #4c2020; color: var(--bad); }
+.badge.word-order { background: #482236; color: var(--pink); }
+.badge.word-outrange { background: #3a2f10; color: #ffe1a1; }
 #wordChips .wc-space { white-space: pre; }
 #wordChips .wc-edit {
   display: inline-flex; align-items: center; gap: 4px;

@@ -88,6 +88,23 @@
     wbScaleDesc = $('wbScaleDesc'), btnWbAbs = $('btnWbAbs'), btnWbScale = $('btnWbScale'),
     btnWbCancel = $('btnWbCancel'), wbNewHead = $('wbNewHead'),
     wordBoundsDiffBody = document.querySelector('#wordBoundsDiff tbody');
+  // WebVTT 画面布局
+  var stageBox = $('stageBox'), mockStage = $('mockStage'), mockStageLabel = $('mockStageLabel'),
+    layoutSvg = $('layoutSvg');
+  var layoutOn = $('layoutOn'), safeMargin = $('safeMargin'), mockAspect = $('mockAspect'),
+    mockAspectWrap = $('mockAspectWrap'), layoutHint = $('layoutHint');
+  var layoutPanel = $('layoutPanel'), layoutCueLabel = $('layoutCueLabel'),
+    layoutCueSrc = $('layoutCueSrc'), btnLayoutReset = $('btnLayoutReset'),
+    btnLayoutBatch = $('btnLayoutBatch');
+  var layAlign = $('layAlign'), layVertical = $('layVertical'), layRegion = $('layRegion'),
+    layLine = $('layLine'), layPosition = $('layPosition'), laySize = $('laySize');
+  var layoutErrors = $('layoutErrors'), layoutRegions = $('layoutRegions'),
+    layoutSrtNote = $('layoutSrtNote');
+  var layoutBatchModal = $('layoutBatchModal'), layoutBatchSummary = $('layoutBatchSummary'),
+    layoutBatchTbody = $('layoutBatchTbody'), btnLayoutBatchCancel = $('btnLayoutBatchCancel'),
+    btnLayoutBatchApply = $('btnLayoutBatchApply'),
+    btnLayoutBatchAll = $('btnLayoutBatchAll'), btnLayoutBatchNone = $('btnLayoutBatchNone');
+  var btnAdoptRegions = $('btnAdoptRegions'), btnSampleLayout = $('btnSampleLayout');
 
   var ctx = canvas.getContext('2d');
 
@@ -100,6 +117,7 @@
     cps: '语速', short: '过短', gap: '间隔', overlap: '重叠', order: '时序',
     longline: '超长行', orphan: '孤立标点', toomany: '超行数',
     'cut-cross': '跨切点', 'cut-near': '近切点', wordtime: '词元时间戳',
+    layout: '布局设置', 'lay-safe': '越安全区', 'lay-occlude': '框体遮挡', 'lay-vmode': '方向冲突',
   };
 
   // ---------- 状态 ----------
@@ -152,6 +170,15 @@
       pendingBounds: null,              // 改 cue 区间时的两方案选择弹窗状态
       editTok: -1,                      // chips 中正在输入时间的 token 下标
     },
+    // WebVTT 画面布局
+    layout: {
+      on: true,                         // 布局叠加开关
+      safePct: 5,                       // 安全边距（画面百分比）
+      mockAspect: '16:9',               // 无媒体时模拟画布比例
+      drag: null,                       // 字幕框拖拽状态
+    },
+    pendingLayoutBatch: null,           // 布局批量套用预览
+    adoptedSettings: {},                // 对照条目 settings 已一致：entryIdx → true
   };
   var rowEls = [];        // 每行 DOM 缓存
   var activeRowIdx = -1;  // 播放头当前所在字幕行
@@ -188,8 +215,17 @@
   // ---------- 撤销 / 重做 ----------
   var lastUndoLabel = '', lastUndoTime = 0;
   // 只有连续的拖拽与键盘微调合并为一步；拆分/合并/分行等结构操作每次独立入栈
-  var COALESCE_LABELS = { drag: true, nudge: true };
-  function snapshot() { return JSON.stringify(state.doc.cues); }
+  var COALESCE_LABELS = { drag: true, nudge: true, layout: true };
+  // 快照同时覆盖 cue 与 REGION 定义（布局修改 / 区域采用也要可撤销）
+  function snapshot() {
+    return JSON.stringify({ cues: state.doc.cues, regions: state.doc.regions || [] });
+  }
+  function restoreSnapshot(s) {
+    var o = JSON.parse(s);
+    if (Array.isArray(o)) { state.doc.cues = o; return; }   // 兼容旧格式
+    state.doc.cues = o.cues;
+    state.doc.regions = o.regions || [];
+  }
   function pushUndo(label) {
     if (!state.doc) return;
     var now = Date.now();
@@ -207,9 +243,10 @@
   function doUndo() {
     if (!state.doc || !state.undoStack.length) return;
     state.redoStack.push(snapshot());
-    state.doc.cues = JSON.parse(state.undoStack.pop());
+    restoreSnapshot(state.undoStack.pop());
     lastUndoLabel = '';
     renderList();
+    rebuildRegionOptions();
     afterChange('已撤销');
     syncCompareAfterEdit();
     renderWordPanel();
@@ -217,9 +254,10 @@
   function doRedo() {
     if (!state.doc || !state.redoStack.length) return;
     state.undoStack.push(snapshot());
-    state.doc.cues = JSON.parse(state.redoStack.pop());
+    restoreSnapshot(state.redoStack.pop());
     lastUndoLabel = '';
     renderList();
+    rebuildRegionOptions();
     afterChange('已重做');
     syncCompareAfterEdit();
     renderWordPanel();
@@ -258,6 +296,9 @@
     wordPanel.classList.add('hidden');
     wordBoundsModal.classList.add('hidden');
     state.word.pendingBounds = null;
+    state.layout.drag = null;
+    state.pendingLayoutBatch = null;
+    layoutBatchModal.classList.add('hidden');
     if (state.playing) setPlaying(false);
     setPlayhead(0);
     state.undoStack.length = 0;
@@ -275,6 +316,9 @@
     renderList();
     updateFileInfo();
     analyzeAndRender();
+    rebuildRegionOptions();
+    renderLayoutPanel();
+    updateStage();
     drawCanvas();
     updateUndoButtons();
     updateButtons();
@@ -642,6 +686,8 @@
     markSelectedRow();
     updateSnapButtons();
     renderWordPanel();
+    renderLayoutPanel();
+    renderLayoutOverlay();
     if (opts.center) centerTimelineOn(state.doc.cues[i]);
     if (opts.scroll && rowEls[i]) rowEls[i].scrollIntoView({ block: 'nearest' });
     drawCanvas();
@@ -662,6 +708,8 @@
       state.problems = [];
       problemSummary.textContent = '未载入字幕';
       problemList.innerHTML = '';
+      renderLayoutPanel();
+      renderLayoutOverlay();
       return;
     }
     state.problems = C.analyze(state.doc.cues, state.settings)
@@ -669,7 +717,9 @@
       .concat(state.scene.cuts.length
         ? C.analyzeCutConflicts(state.doc.cues, state.scene.cuts, state.scene.cfg.tol)
         : [])
-      .concat(C.analyzeWordTimings(state.doc.cues));
+      .concat(C.analyzeWordTimings(state.doc.cues))
+      .concat(C.analyzeLayoutSettings(state.doc))
+      .concat(C.analyzeLayoutConflicts(state.doc, { safePct: state.layout.safePct }));
     state.problemByCue = {};
     state.problems.forEach(function (p) {
       (state.problemByCue[p.cue] = state.problemByCue[p.cue] || []).push(p.type);
@@ -724,6 +774,13 @@
         } else if (p.type === 'wordtime') {
           // 逐词时间戳错误：选中、展开词元轨道、选中文本并高亮出错标记
           locateWordError(p);
+        } else if (p.type === 'layout' || p.type === 'lay-safe' ||
+          p.type === 'lay-occlude' || p.type === 'lay-vmode') {
+          // 布局问题：选中对应字幕并闪烁布局面板，播放头移到该条以便画面叠加显示
+          selectCue(p.cue, { center: true, scroll: true });
+          setPlayhead(state.doc.cues[p.cue].start);
+          flashLayoutPanel();
+          setStatus('定位到第 ' + cue.num + ' 条：' + p.msg);
         } else {
           selectCue(p.cue, { center: true, scroll: true });
           setStatus('定位到第 ' + cue.num + ' 条');
@@ -732,6 +789,8 @@
       frag.appendChild(li);
     });
     problemList.appendChild(frag);
+    renderLayoutPanel();
+    renderLayoutOverlay();
   }
 
   // ---------- 时间轴 ----------
@@ -1164,6 +1223,7 @@
     }
     updateWordPreview();
     refreshWordPanelLive();
+    renderLayoutOverlay();
     if (state.compareOn) drawCompareCanvas();
   }
   // 当前字幕预览改由 updateWordPreview() 统一渲染（保留标签并逐词高亮）
@@ -1231,6 +1291,7 @@
       sceneTo.value = '';
     }
     updateSceneButtons();
+    updateStage();
     setPlayhead(0);
     setStatus('已载入媒体《' + p.name + '》（仅本地对象 URL，不上传）。拖动播放头即可联动定位。');
   });
@@ -1287,6 +1348,7 @@
     try { localStorage.removeItem(MEDIA_MARK_KEY); } catch (e) {}
     updatePlayUI();
     updateSceneButtons();
+    updateStage();
   }
   btnUnloadMedia.addEventListener('click', function () {
     resetMediaState();
@@ -1538,6 +1600,10 @@
       if (e.key === 'Escape') { hideWordBounds(false); setStatus('已取消：区间与词元均未改变'); }
       return;
     }
+    if (!layoutBatchModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') hideLayoutBatch();
+      return;
+    }
     var step = e.shiftKey ? 500 : (e.altKey ? 10 : 100);
     switch (e.key) {
       case ' ':
@@ -1669,6 +1735,7 @@
     return JSON.stringify({
       format: state.doc.format,
       header: state.doc.header,
+      regions: state.doc.regions || [],
       cues: state.doc.cues,
       fileName: state.fileName,
     });
@@ -1724,6 +1791,8 @@
       pushUndo('restore');
       state.doc.cues = payload.cues;
       if (payload.header !== undefined) state.doc.header = payload.header;
+      if (payload.regions !== undefined) state.doc.regions = payload.regions;
+      rebuildRegionOptions();
       renderList();
       afterChange('已恢复本地草稿（' + payload.cues.length + ' 条）');
     } catch (e) {
@@ -1778,6 +1847,13 @@
       .then(function (r) { return r.json(); })
       .then(function (data) { loadDocument(data.content, data.filename); })
       .catch(function () { setStatus('无法获取 WebVTT 示例（服务器未响应）'); });
+  });
+
+  btnSampleLayout.addEventListener('click', function () {
+    fetch('/api/sample?kind=layout')
+      .then(function (r) { return r.json(); })
+      .then(function (data) { loadDocument(data.content, data.filename); })
+      .catch(function () { setStatus('无法获取布局示例（服务器未响应）'); });
   });
 
   btnExport.addEventListener('click', function () {
@@ -1858,6 +1934,7 @@
     state.refName = null;
     state.refResult = null;
     state.adopted = {};
+    state.adoptedSettings = {};
     state.cmpSelected = -1;
     state.pendingMerge = null;
     state.compareOn = false;
@@ -1865,6 +1942,7 @@
     compareInput.value = '';
     btnCompareView.classList.add('hidden');
     btnCompareView.textContent = '对照合并';
+    btnAdoptRegions.classList.add('hidden');
     hideCompareView();
     mergeModal.classList.add('hidden');
     if (!silent) setStatus('已关闭对照：对照文件只在内存中，刷新后需重新选择');
@@ -1895,6 +1973,7 @@
       state.refDoc = doc;
       state.refName = f.name;
       state.adopted = {};
+      state.adoptedSettings = {};
       state.cmpSelected = -1;
       runAlign();
       compareFileInfo.textContent = f.name + ' · ' + doc.format.toUpperCase() + ' · ' + doc.cues.length + ' 条';
@@ -1916,8 +1995,10 @@
     state.refName = null;
     state.refResult = null;
     state.adopted = {};
+    state.adoptedSettings = {};
     state.cmpSelected = -1;
     btnCompareView.classList.add('hidden');
+    btnAdoptRegions.classList.add('hidden');
     hideCompareView();
     setStatus('已关闭对照；当前工作字幕的修改保留。对照文件刷新后需重新选择');
   });
@@ -1967,13 +2048,16 @@
     if (high && e.kind !== 'pair') return true;
     if (f === 'all') return false;
     if (f === 'diff') {
-      if (e.kind === 'pair') return !(e.textChanged || e.timeChanged || e.alen !== 1 || e.blen !== 1);
+      if (e.kind === 'pair') {
+        return !(e.textChanged || e.timeChanged || e.settingsChanged || e.alen !== 1 || e.blen !== 1);
+      }
       return false;
     }
     if (f === 'conflict') return !(e.kind === 'pair' && e.conflict);
     if (f === 'text') return !(e.kind === 'pair' && e.textChanged);
     if (f === 'time') return !(e.kind === 'pair' && e.timeChanged);
     if (f === 'struct') return !(e.kind === 'pair' && (e.alen !== 1 || e.blen !== 1));
+    if (f === 'settings') return !(e.kind === 'pair' && e.settingsChanged);
     if (f === 'only') return e.kind === 'pair';
     return false;
   }
@@ -1986,6 +2070,7 @@
     if (e.textChanged && e.timeChanged) return { cls: 'kb-both', text: '文字+时间' };
     if (e.textChanged) return { cls: 'kb-text', text: '文字变化' };
     if (e.timeChanged) return { cls: 'kb-time', text: '时间偏移' };
+    if (e.settingsChanged) return { cls: 'kb-settings', text: '布局差异' };
     return { cls: 'kb-same', text: '一致' };
   }
 
@@ -2034,14 +2119,46 @@
     });
     cmpTbody.appendChild(frag);
     updateCmpStats(res, shown);
+    updateRegionsAdoptBtn();
   }
+
+  // 当前版与对照版的 REGION 定义是否一致（按原文比较）
+  function regionsRawOf(doc) {
+    return JSON.stringify(((doc && doc.regions) || []).map(function (r) { return r.raw; }));
+  }
+  function updateRegionsAdoptBtn() {
+    var show = !!(state.refDoc && state.doc &&
+      regionsRawOf(state.doc) !== regionsRawOf(state.refDoc));
+    btnAdoptRegions.classList.toggle('hidden', !show);
+    if (show) {
+      btnAdoptRegions.textContent =
+        '采用对照版区域（' + ((state.refDoc.regions || []).length) + ' 个）';
+    }
+  }
+  btnAdoptRegions.addEventListener('click', function () {
+    if (!state.doc || !state.refDoc) return;
+    pushUndo('regions');
+    state.doc.regions = JSON.parse(JSON.stringify(state.refDoc.regions || []));
+    rebuildRegionOptions();
+    afterChange('已采用对照版的 REGION 定义（' + state.doc.regions.length + ' 个，可撤销）');
+    updateRegionsAdoptBtn();
+  });
 
   function updateCmpStats(res, shown) {
     var s = res.stats;
+    var nSettings = 0;
+    res.entries.forEach(function (e) {
+      if (e.kind === 'pair' && e.settingsChanged) nSettings++;
+    });
     cmpStats.textContent = '当前版 ' + state.doc.cues.length + ' 条 · 对照版 ' +
       state.refDoc.cues.length + ' 条 · 配对 ' + s.pairs +
       '（仅当前 ' + s.onlyA + ' / 仅对照 ' + s.onlyB + '）· 冲突 ' + s.conflicts +
+      (nSettings ? ' · 布局差异 ' + nSettings : '') +
       ' · 已逐项采用 ' + Object.keys(state.adopted).length + ' · 显示 ' + shown + ' 项';
+  }
+
+  function settingsDiffLine(s) {
+    return '<div class="cmp-settings-line">⚙ ' + (s ? esc(s) : '（默认布局）') + '</div>';
   }
 
   function renderEntryRow(e, idx) {
@@ -2050,9 +2167,14 @@
     if (e.kind === 'pair' && e.conflict && e.reasons.length) {
       kindCell += '<span class="cmp-conf-note">' + e.reasons.map(esc).join('<br>') + '</span>';
     }
+    if (e.kind === 'pair' && e.settingsChanged && (e.textChanged || e.timeChanged)) {
+      kindCell += '<span class="cmp-conf-note cmp-note-settings">另含布局设置差异</span>';
+    }
     if (state.adopted[idx]) {
       kindCell += '<span class="cmp-conf-note" style="color:var(--good)">已采用：' +
-        ({ text: '文本', time: '时间', full: '整条', group: '整组' }[state.adopted[idx]] || state.adopted[idx]) + '</span>';
+        ({ text: '文本', time: '时间', full: '整条', group: '整组', settings: '布局' }[state.adopted[idx]] || state.adopted[idx]) + '</span>';
+    } else if (e.kind === 'pair' && e.settingsChanged && state.adoptedSettings[idx]) {
+      kindCell += '<span class="cmp-conf-note" style="color:var(--good)">布局已一致</span>';
     }
     var aTime = '', bTime = '', aText = '', bText = '';
     if (e.kind === 'pair') {
@@ -2073,6 +2195,11 @@
       }
       if (e.alen === 1 && e.blen === 1 && e.timeChanged) {
         bTime += '<span class="dt shift">Δ起 ' + fmtShift(e.dStart) + ' Δ止 ' + fmtShift(e.dEnd) + '</span>';
+      }
+      // 布局设置差异：两侧分别列出 settings 原文
+      if (e.alen === 1 && e.blen === 1 && e.settingsChanged) {
+        aText += settingsDiffLine(state.doc.cues[e.ai].settings);
+        bText += settingsDiffLine(state.refDoc.cues[e.bj].settings);
       }
     } else if (e.kind === 'only-a') {
       aTime = groupTimeHtml(state.doc.cues, e.ai, 1);
@@ -2124,6 +2251,9 @@
       } else {
         btn('text', 'op-text', '采用文本', '只采用对照文本（时间与标识不变）', !!errs.text, errs.text);
         btn('time', 'op-time', '采用时间', '只采用对照时间（文本与标识不变）', !!errs.time, errs.time);
+        btn('settings', 'op-settings', '采用布局',
+          '只采用对照版的 cue 布局设置（line/position/size/align/vertical/region 原文）',
+          !!errs.settings, errs.settings);
         btn('full', 'op-full', '整条采用', '文本 + 时间均采用对照版（保留 WebVTT 标识 / 设置）',
           !!errs.full, errs.full);
       }
@@ -2183,6 +2313,7 @@
     var cues = state.doc.cues, ref = state.refDoc.cues;
     if (mode === 'text') res = C.adoptText(cues, e.ai, ref[e.bj].lines);
     else if (mode === 'time') res = C.adoptTime(cues, e.ai, ref[e.bj].start, ref[e.bj].end);
+    else if (mode === 'settings') res = C.adoptSettings(cues, e.ai, ref[e.bj].settings || '');
     else if (mode === 'full') res = C.adoptFull(cues, e.ai, ref[e.bj], state.doc.format);
     else if (mode === 'group') res = C.replaceGroup(cues, e.ai, e.alen, ref, e.bj, e.blen, state.doc.format);
     else if (mode === 'insert') res = C.insertOnlyB(cues, e.aBefore, ref[e.bj], state.doc.format);
@@ -2203,7 +2334,7 @@
     state.adopted = recomputeAdopted();
     selectEntryAfterAdoption(prevEntry);   // 内部 renderCompare
     drawCompareCanvas();
-    var label = { text: '文本', time: '时间', full: '整条', group: '整组', insert: '插入对照条', delete: '删除仅当前条' }[mode];
+    var label = { text: '文本', time: '时间', settings: '布局设置', full: '整条', group: '整组', insert: '插入对照条', delete: '删除仅当前条' }[mode];
     setStatus('已采用对照版' + label + '（撤销可回退，节奏检查 / 草稿 / 导出已同步）');
   }
 
@@ -2229,20 +2360,27 @@
       if (entryFiltered(e)) return;
       if (e.kind === 'pair') {
         if (e.conflict) return;                      // 冲突留待手动
-        if (!(e.textChanged || e.timeChanged || e.alen !== 1 || e.blen !== 1)) return;
+        if (!(e.textChanged || e.timeChanged || e.settingsChanged || e.alen !== 1 || e.blen !== 1)) return;
         var done = state.adopted[i];
+        var settingsDone = state.adoptedSettings[i];
         if (e.alen !== 1 || e.blen !== 1) {
           // 结构组：已整组采用则跳过
           if (done === 'group') return;
           actions[i] = 'group';
         } else if (done === 'full') {
-          return;                                   // 整条已采用
+          // 整条已采用（文本+时间）；布局仍不同则批量补布局
+          if (e.settingsChanged && !settingsDone) actions[i] = 'settings';
         } else if (done === 'text') {
           if (e.timeChanged) actions[i] = 'time';   // 仅文本已采用 → 批量补时间
+          else if (e.settingsChanged && !settingsDone) actions[i] = 'settings';
         } else if (done === 'time') {
           if (e.textChanged) actions[i] = 'text';   // 仅时间已采用 → 批量补文本
+          else if (e.settingsChanged && !settingsDone) actions[i] = 'settings';
+        } else if (done === 'settings') {
+          if (e.textChanged || e.timeChanged) actions[i] = 'full';
         } else {
-          actions[i] = 'full';
+          if (e.textChanged || e.timeChanged) actions[i] = 'full';
+          else if (e.settingsChanged) actions[i] = 'settings';   // 仅布局差异 → 采用布局
         }
       } else if (e.kind === 'only-b') {
         if (state.adopted[i] === 'insert') return;
@@ -2265,7 +2403,7 @@
     mergeModal.classList.remove('hidden');
   });
 
-  var MODE_LABEL = { text: '采用文本', time: '采用时间', full: '整条采用', group: '整组采用', insert: '插入', delete: '删除' };
+  var MODE_LABEL = { text: '采用文本', time: '采用时间', settings: '采用布局', full: '整条采用', group: '整组采用', insert: '插入', delete: '删除' };
 
   function renderMergeModal() {
     var pend = state.pendingMerge;
@@ -2620,7 +2758,8 @@
 
   function recomputeAdopted() {
     var out = {};
-    if (!state.refResult) return out;
+    var settingsEq = {};
+    if (!state.refResult) { state.adoptedSettings = settingsEq; return out; }
     var cur = state.doc.cues, ref = state.refDoc.cues;
     function norm(lines) { return C.normalizeText(lines.join(' ')); }
     state.refResult.entries.forEach(function (e, i) {
@@ -2653,6 +2792,8 @@
         if (textMatch && timeMatch) out[i] = 'full';
         else if (textMatch) out[i] = 'text';
         else if (timeMatch) out[i] = 'time';
+        // 布局设置是否已一致（一对一）：与文本 / 时间采用状态分开跟踪
+        if ((cur[e.ai].settings || '') === (ref[e.bj].settings || '')) settingsEq[i] = true;
       } else if (e.kind === 'only-b') {
         var r = ref[e.bj];
         var hit = cur.some(function (c) {
@@ -2662,6 +2803,7 @@
       }
       // only-a 删除状态无法可靠回推，保持无标记
     });
+    state.adoptedSettings = settingsEq;
     return out;
   }
 
@@ -3293,6 +3435,24 @@
     if (!state.doc) return null;
     var k = (i === undefined || i === null) ? state.selected : i;
     return state.doc.cues[k] ? state.doc.cues[k].lines.slice() : null;
+  };
+  // 画面布局测试钩子
+  window.__dbgCueSettings = function (i) {
+    if (!state.doc) return null;
+    var k = (i === undefined || i === null) ? state.selected : i;
+    return state.doc.cues[k] ? state.doc.cues[k].settings : null;
+  };
+  window.__dbgRegions = function () {
+    return ((state.doc && state.doc.regions) || []).map(function (r) { return r.id; });
+  };
+  window.__dbgLayoutBox = function (i) {
+    if (!state.doc) return null;
+    var k = (i === undefined || i === null) ? state.selected : i;
+    return state.doc.cues[k]
+      ? C.computeCueBox(state.doc.cues[k], { regions: state.doc.regions }) : null;
+  };
+  window.__dbgSerialize = function (fmt) {
+    return state.doc ? C.serialize(state.doc, fmt || state.doc.format) : null;
   };
   function cueHasWordMarks(cue) {
     if (!cue) return false;
@@ -3951,10 +4111,503 @@
     nowCueOverlay.innerHTML = pv.html || esc(list[idx].lines.join(' '));
   }
 
+  // ============================================================
+  // WebVTT 画面布局编辑
+  // 舞台叠加（媒体画面 / 无媒体模拟画布）+ 字幕框拖动缩放 + 精确值编辑 +
+  // 安全区与同时刻冲突提示 + 批量套用。布局修改接入撤销 / 重做 / 草稿；
+  // SRT 仅按默认位置预览，不写入布局设置。
+  // ============================================================
+
+  var LAYOUT_CFG_KEY = 'subcal.layout';
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+
+  function loadLayoutCfg() {
+    try {
+      var saved = JSON.parse(localStorage.getItem(LAYOUT_CFG_KEY) || '{}');
+      if (saved.on !== undefined) state.layout.on = !!saved.on;
+      if (saved.safePct !== undefined) state.layout.safePct = clamp(+saved.safePct || 0, 0, 25);
+      if (saved.mockAspect !== undefined) state.layout.mockAspect = String(saved.mockAspect);
+    } catch (e) { /* 忽略损坏的配置 */ }
+    layoutOn.checked = state.layout.on;
+    safeMargin.value = state.layout.safePct;
+    mockAspect.value = state.layout.mockAspect;
+  }
+  function saveLayoutCfg() {
+    try {
+      localStorage.setItem(LAYOUT_CFG_KEY, JSON.stringify({
+        on: state.layout.on, safePct: state.layout.safePct, mockAspect: state.layout.mockAspect,
+      }));
+    } catch (e) {}
+  }
+
+  // ---------- 舞台（视频画面 / 模拟画布） ----------
+
+  // 叠加层应覆盖的矩形（相对 stageBox 的 px）：
+  // 视频 → 按 object-fit:contain 计算真实画面区；否则 → 模拟画布
+  function layoutTargetRect() {
+    var boxR = stageBox.getBoundingClientRect();
+    if (state.media.ready && state.media.isVideo && mediaVideo.videoWidth) {
+      var vw = mediaVideo.videoWidth, vh = mediaVideo.videoHeight;
+      var ew = mediaVideo.clientWidth, eh = mediaVideo.clientHeight;
+      if (ew && eh && vw && vh) {
+        var scale = Math.min(ew / vw, eh / vh);
+        var cw = vw * scale, ch = vh * scale;
+        var vr = mediaVideo.getBoundingClientRect();
+        return {
+          left: vr.left - boxR.left + (ew - cw) / 2,
+          top: vr.top - boxR.top + (eh - ch) / 2,
+          width: cw, height: ch,
+        };
+      }
+    }
+    var mr = mockStage.getBoundingClientRect();
+    return { left: mr.left - boxR.left, top: mr.top - boxR.top, width: mr.width, height: mr.height };
+  }
+
+  function positionLayoutSvg() {
+    var r = layoutTargetRect();
+    layoutSvg.style.left = r.left + 'px';
+    layoutSvg.style.top = r.top + 'px';
+    layoutSvg.style.width = r.width + 'px';
+    layoutSvg.style.height = r.height + 'px';
+  }
+
+  // 视频 ↔ 模拟画布切换；模拟画布按所选比例显示
+  function updateStage() {
+    var hasVideo = state.media.ready && state.media.isVideo;
+    mockStage.classList.toggle('hidden', hasVideo);
+    mockAspectWrap.classList.toggle('hidden', hasVideo);
+    if (!hasVideo) {
+      var parts = state.layout.mockAspect.split(':');
+      var ar = (+parts[0]) / (+parts[1]);
+      mockStage.style.aspectRatio = parts[0] + ' / ' + parts[1];
+      mockStage.style.maxWidth = Math.round(200 * ar) + 'px';   // 限高约 200px
+      mockStageLabel.textContent = '模拟画面 · ' + state.layout.mockAspect +
+        (state.media.ready ? '（音频无画面）' : '（无媒体）');
+    }
+    positionLayoutSvg();
+    renderLayoutOverlay();
+  }
+
+  // ---------- 叠加层渲染 ----------
+
+  function svgEl(tag, attrs, parent) {
+    var el = document.createElementNS(SVG_NS, tag);
+    if (attrs) Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+    if (parent) parent.appendChild(el);
+    return el;
+  }
+
+  // 字幕框是否可拖动编辑（SRT 与区域字幕不可拖动）
+  function isBoxEditable(i) {
+    if (!state.doc || state.doc.format !== 'vtt') return false;
+    var box = C.computeCueBox(state.doc.cues[i], { regions: state.doc.regions });
+    return box.source !== 'region';
+  }
+
+  function layoutBoxClass(i, box) {
+    var cls = 'lay-box src-' + box.source;
+    if (i === state.selected) cls += ' selected';
+    var types = state.problemByCue[i] || [];
+    if (types.indexOf('layout') !== -1) cls += ' p-layout';
+    if (types.indexOf('lay-safe') !== -1) cls += ' p-safe';
+    if (types.indexOf('lay-occlude') !== -1) cls += ' p-occlude';
+    if (types.indexOf('lay-vmode') !== -1) cls += ' p-vmode';
+    return cls;
+  }
+
+  function renderLayoutOverlay() {
+    layoutSvg.innerHTML = '';
+    if (!state.layout.on || !state.doc) { layoutSvg.classList.add('hidden'); return; }
+    layoutSvg.classList.remove('hidden');
+    var r = layoutTargetRect();
+    var W = r.width, H = r.height;
+    if (W < 10 || H < 10) return;
+    layoutSvg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    // 安全区
+    var safe = state.layout.safePct;
+    svgEl('rect', {
+      x: (safe / 100 * W).toFixed(2), y: (safe / 100 * H).toFixed(2),
+      width: ((100 - 2 * safe) / 100 * W).toFixed(2), height: ((100 - 2 * safe) / 100 * H).toFixed(2),
+      'class': 'lay-safe-area', 'pointer-events': 'none',
+    }, layoutSvg);
+    var safeLabel = svgEl('text', {
+      x: (safe / 100 * W + 4).toFixed(2), y: (safe / 100 * H + 11).toFixed(2),
+      'class': 'lay-safe-label', 'pointer-events': 'none',
+    }, layoutSvg);
+    safeLabel.textContent = '安全区 ' + safe + '%';
+    // 播放头时刻的字幕框
+    var t = state.playheadMs;
+    state.doc.cues.forEach(function (cue, i) {
+      if (t < cue.start || t >= cue.end) return;
+      var box = C.computeCueBox(cue, { regions: state.doc.regions });
+      drawLayoutBox(i, cue, box, W, H);
+    });
+  }
+
+  function drawLayoutBox(i, cue, box, W, H) {
+    var x = box.x / 100 * W, y = box.y / 100 * H;
+    var w = Math.max(2, box.w / 100 * W), h = Math.max(2, box.h / 100 * H);
+    var g = svgEl('g', { 'class': layoutBoxClass(i, box), 'data-i': i }, layoutSvg);
+    svgEl('rect', { x: x, y: y, width: w, height: h, 'class': 'lay-box-rect' }, g);
+    var label = svgEl('text', { x: x + 3, y: y - 4 < 9 ? y + 12 : y - 4, 'class': 'lay-box-label' }, g);
+    label.textContent = '#' + cue.num +
+      (box.region ? ' · 区域 ' + box.region : '') +
+      (box.vertical ? ' · 竖排 ' + box.vertical : '');
+    // 文本行（预览近似：按行数均分框高）
+    var lines = cue.lines.map(function (l) { return l.replace(/<[^>]+>/g, ''); });
+    var n = Math.max(1, lines.length);
+    lines.forEach(function (l, li) {
+      var attrs = { 'class': 'lay-box-text', 'dominant-baseline': 'middle' };
+      if (!box.vertical) {
+        var lineH = h / n;
+        attrs.x = box.align === 'start' || box.align === 'left' ? x + 4
+          : box.align === 'end' || box.align === 'right' ? x + w - 4 : x + w / 2;
+        attrs.y = y + lineH * (li + 0.5);
+        attrs['text-anchor'] = box.align === 'start' || box.align === 'left' ? 'start'
+          : box.align === 'end' || box.align === 'right' ? 'end' : 'middle';
+        attrs['font-size'] = Math.max(7, Math.min(lineH * 0.62, 18));
+      } else {
+        var colW = w / n;
+        attrs.style = 'writing-mode: vertical-rl;';
+        attrs.x = box.vertical === 'rl' ? x + w - colW * (li + 0.5) : x + colW * (li + 0.5);
+        attrs.y = box.align === 'start' ? y + 4 : box.align === 'end' ? y + h - 4 : y + h / 2;
+        attrs['text-anchor'] = box.align === 'start' ? 'start' : box.align === 'end' ? 'end' : 'middle';
+        attrs['font-size'] = Math.max(7, Math.min(colW * 0.62, 18));
+      }
+      var te = svgEl('text', attrs, g);
+      te.textContent = l;
+    });
+    // 选中且可编辑：横排给左右边缘手柄，竖排给上下边缘手柄
+    if (i === state.selected && isBoxEditable(i)) {
+      if (!box.vertical) {
+        drawLayoutHandle(g, x, y + h / 2, 'w');
+        drawLayoutHandle(g, x + w, y + h / 2, 'e');
+      } else {
+        drawLayoutHandle(g, x + w / 2, y, 'n');
+        drawLayoutHandle(g, x + w / 2, y + h, 's');
+      }
+    }
+  }
+
+  function drawLayoutHandle(g, cx, cy, dir) {
+    svgEl('rect', {
+      x: cx - 4, y: cy - 4, width: 8, height: 8,
+      'class': 'lay-handle lay-handle-' + dir, 'data-h': dir,
+    }, g);
+  }
+
+  // ---------- 字幕框拖动 / 缩放 ----------
+
+  layoutSvg.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;
+    var g = e.target.closest ? e.target.closest('g.lay-box') : null;
+    if (!g || !state.doc) return;
+    var i = +g.dataset.i;
+    selectCue(i, { scroll: false });
+    if (!isBoxEditable(i)) {
+      var cue0 = state.doc.cues[i];
+      setStatus(state.doc.format !== 'vtt'
+        ? 'SRT 不携带布局设置，仅按默认位置预览'
+        : '第 ' + cue0.num + ' 条由区域「' +
+          (C.computeCueBox(cue0, { regions: state.doc.regions }).region || '') +
+          '」定位，请在 REGION 块中调整');
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    var r = layoutTargetRect();
+    if (r.width < 1 || r.height < 1) return;
+    var handle = e.target.closest('rect.lay-handle');
+    state.layout.drag = {
+      i: i, mode: handle ? 'resize-' + handle.dataset.h : 'move',
+      startX: (e.clientX - r.left) / r.width * 100,
+      startY: (e.clientY - r.top) / r.height * 100,
+      origBox: C.computeCueBox(state.doc.cues[i], { regions: state.doc.regions }),
+      moved: false, undoPushed: false,
+    };
+  });
+
+  window.addEventListener('mousemove', function (e) {
+    var d = state.layout.drag;
+    if (!d || !state.doc) return;
+    var r = layoutTargetRect();
+    if (r.width < 1 || r.height < 1) return;
+    var dx = (e.clientX - r.left) / r.width * 100 - d.startX;
+    var dy = (e.clientY - r.top) / r.height * 100 - d.startY;
+    if (!d.moved && Math.abs(dx) < 0.3 && Math.abs(dy) < 0.3) return;
+    d.moved = true;
+    var o = d.origBox;
+    var b = { x: o.x, y: o.y, w: o.w, h: o.h };
+    if (d.mode === 'move') {
+      b.x = clamp(o.x + dx, -20, 120 - o.w);
+      b.y = clamp(o.y + dy, -20, 120 - o.h);
+    } else if (d.mode === 'resize-e') {
+      b.w = clamp(o.w + dx, 5, 140);
+    } else if (d.mode === 'resize-w') {
+      b.w = clamp(o.w - dx, 5, 140);
+      b.x = o.x + (o.w - b.w);
+    } else if (d.mode === 'resize-s') {
+      b.h = clamp(o.h + dy, 5, 140);
+    } else if (d.mode === 'resize-n') {
+      b.h = clamp(o.h - dy, 5, 140);
+      b.y = o.y + (o.h - b.h);
+    }
+    if (!d.undoPushed) { pushUndo('layout'); d.undoPushed = true; }
+    // 实时写回模型：以拖动前的框为基准按总增量换算，避免逐帧累积误差
+    var cue = state.doc.cues[d.i];
+    cue.settings = C.applyLayoutUpdates(cue.settings, C.boxToSettings(cue, b));
+    analyzeAndRender();
+  });
+
+  window.addEventListener('mouseup', function () {
+    var d = state.layout.drag;
+    if (!d) return;
+    state.layout.drag = null;
+    if (!d.moved || !state.doc) return;
+    var cue = state.doc.cues[d.i];
+    afterChange('已调整第 ' + cue.num + ' 条布局：' + (cue.settings || '（默认位置）'));
+  });
+
+  // ---------- 布局面板（精确值编辑） ----------
+
+  function setLayoutField(el, v) { if (document.activeElement !== el) el.value = v; }
+
+  function renderLayoutPanel() {
+    var cue = (state.doc && state.selected >= 0) ? state.doc.cues[state.selected] : null;
+    layoutPanel.classList.toggle('hidden', !cue);
+    if (!cue) return;
+    var isVtt = state.doc.format === 'vtt';
+    layoutCueLabel.textContent = '#' + cue.num;
+    layoutSrtNote.classList.toggle('hidden', isVtt);
+    var map = C.tokenMap(C.parseCueSettings(cue.settings).tokens);
+    setLayoutField(layAlign, map.align || '');
+    setLayoutField(layVertical, map.vertical || '');
+    setLayoutField(layRegion, map.region || '');
+    setLayoutField(layLine, map.line || '');
+    setLayoutField(layPosition, map.position || '');
+    setLayoutField(laySize, map.size || '');
+    [layAlign, layVertical, layRegion, layLine, layPosition, laySize,
+      btnLayoutReset, btnLayoutBatch].forEach(function (el) { el.disabled = !isVtt; });
+    var box = C.computeCueBox(cue, { regions: state.doc.regions });
+    layoutCueSrc.textContent = box.source === 'region'
+      ? '位置由区域「' + box.region + '」决定'
+      : box.source === 'default' ? '默认位置（底部居中）' : '显式布局';
+    // 该条的布局校验错误（越界 / 重复键 / 区域不存在 / 组合冲突）
+    var errs = isVtt ? C.analyzeCueSettings(state.doc, state.selected) : [];
+    layoutErrors.innerHTML = errs.map(function (e) {
+      return '<div class="lay-err">⚠ ' + esc(e.msg) + '</div>';
+    }).join('');
+    renderRegionList();
+    layoutHint.textContent = isVtt
+      ? (box.source === 'region' ? '区域字幕不可拖动，位置由 REGION 块决定'
+        : '拖动字幕框改 position/line，拖边缘手柄改 size')
+      : 'SRT 仅按默认位置预览';
+  }
+
+  function renderRegionList() {
+    var rs = (state.doc && state.doc.regions) || [];
+    if (!rs.length) {
+      layoutRegions.textContent = state.doc && state.doc.format === 'vtt' ? '本文件无 REGION 块' : '';
+      return;
+    }
+    layoutRegions.innerHTML = '<span class="label">区域：</span>' + rs.map(function (r) {
+      var m = C.tokenMap(r.settings);
+      var bits = [];
+      if (m.width) bits.push('宽 ' + m.width);
+      if (m.lines) bits.push(m.lines + ' 行');
+      if (m.viewportanchor) bits.push('锚 ' + m.viewportanchor);
+      var errTxt = r.errors.map(function (e) { return e.msg; }).join('；');
+      return '<span class="lay-region' + (r.errors.length ? ' has-err' : '') + '"' +
+        (errTxt ? ' title="' + esc(errTxt) + '"' : '') + '>「' + esc(r.id || '（无 id）') + '」' +
+        (bits.length ? ' ' + esc(bits.join(' · ')) : '') +
+        (r.errors.length ? ' ⚠' : '') + '</span>';
+    }).join(' ');
+  }
+
+  function rebuildRegionOptions() {
+    layRegion.innerHTML = '<option value="">无</option>';
+    ((state.doc && state.doc.regions) || []).forEach(function (r) {
+      if (!r.id) return;
+      var o = document.createElement('option');
+      o.value = r.id;
+      o.textContent = r.id;
+      layRegion.appendChild(o);
+    });
+  }
+
+  function flashLayoutPanel() {
+    layoutPanel.classList.remove('flash-panel');
+    void layoutPanel.offsetWidth;   // 重新触发动画
+    layoutPanel.classList.add('flash-panel');
+  }
+
+  // 精确值 / 下拉修改 → 校验通过才写模型；不合法标红并说明，不擅自改写
+  function applyLayoutForm() {
+    var cue = (state.doc && state.selected >= 0) ? state.doc.cues[state.selected] : null;
+    if (!cue || state.doc.format !== 'vtt') return;
+    var updates = {
+      align: layAlign.value || null,
+      vertical: layVertical.value || null,
+      region: layRegion.value || null,
+      line: layLine.value.trim() || null,
+      position: layPosition.value.trim() || null,
+      size: laySize.value.trim() || null,
+    };
+    var fields = { line: layLine, position: layPosition, size: laySize };
+    var bad = null;
+    ['line', 'position', 'size'].forEach(function (k) {
+      fields[k].classList.remove('invalid');
+      if (updates[k] !== null) {
+        var err = C.validateCueSetting(k, updates[k]);
+        if (err && !bad) bad = { k: k, err: err };
+      }
+    });
+    if (bad) {
+      fields[bad.k].classList.add('invalid');
+      setStatus('布局未应用：' + bad.err);
+      return;
+    }
+    var ns = C.applyLayoutUpdates(cue.settings, updates);
+    if (ns === (cue.settings || '')) return;
+    pushUndo('layout');
+    cue.settings = ns;
+    afterChange('已修改第 ' + cue.num + ' 条布局：' + (ns || '（恢复默认位置）'));
+  }
+  [layAlign, layVertical, layRegion, layLine, layPosition, laySize].forEach(function (el) {
+    el.addEventListener('change', applyLayoutForm);
+  });
+
+  btnLayoutReset.addEventListener('click', function () {
+    var cue = (state.doc && state.selected >= 0) ? state.doc.cues[state.selected] : null;
+    if (!cue || state.doc.format !== 'vtt') return;
+    var updates = {};
+    C.LAYOUT_KEYS.forEach(function (k) { updates[k] = null; });
+    var ns = C.applyLayoutUpdates(cue.settings, updates);
+    if (ns === (cue.settings || '')) {
+      setStatus('第 ' + cue.num + ' 条本无布局设置');
+      return;
+    }
+    pushUndo('layout');
+    cue.settings = ns;
+    afterChange('已恢复第 ' + cue.num + ' 条为默认布局（未知设置保留）');
+  });
+
+  // ---------- 布局批量套用 ----------
+
+  btnLayoutBatch.addEventListener('click', function () {
+    if (!state.doc || state.selected < 0 || state.doc.format !== 'vtt') return;
+    var idxs = state.doc.cues.map(function (_, i) { return i; });
+    var items = C.planLayoutApply(state.doc, state.selected, idxs);
+    items.forEach(function (item) { item.checked = !item.error && item.changed; });
+    state.pendingLayoutBatch = { src: state.selected, items: items };
+    renderLayoutBatch();
+    layoutBatchModal.classList.remove('hidden');
+  });
+
+  function renderLayoutBatch() {
+    var pend = state.pendingLayoutBatch;
+    if (!pend || !state.doc) return;
+    var src = state.doc.cues[pend.src];
+    var nUsable = 0, nBlocked = 0;
+    layoutBatchTbody.innerHTML = '';
+    pend.items.forEach(function (item) {
+      if (item.error) nBlocked++;
+      else if (item.changed) nUsable++;
+      var tr = document.createElement('tr');
+      tr.className = item.error ? 'lb-blocked' : (item.changed ? '' : 'lb-same');
+      tr.innerHTML =
+        '<td>' + (item.error ? '' :
+          '<input type="checkbox" data-i="' + item.i + '"' + (item.checked ? ' checked' : '') + '>') + '</td>' +
+        '<td class="mono">#' + esc(item.num) + '</td>' +
+        '<td class="lb-old">' + esc(item.oldSettings || '（默认）') + '</td>' +
+        '<td class="lb-new">' + esc(item.error ? '—' : (item.newSettings || '（默认）')) + '</td>' +
+        '<td>' + (item.error
+          ? '<span class="lb-err">不可用：' + esc(item.error) + '</span>'
+          : item.changed ? '<span class="lb-ok">将变更</span>' : '<span class="muted">无变化</span>') + '</td>';
+      layoutBatchTbody.appendChild(tr);
+    });
+    layoutBatchSummary.textContent = '源：第 ' + src.num + ' 条（' + (src.settings || '默认布局') +
+      '）。勾选要套用该布局的字幕：将变更 ' + nUsable + ' 条，不可用 ' + nBlocked + ' 条。';
+    btnLayoutBatchApply.disabled = nUsable === 0;
+  }
+
+  layoutBatchTbody.addEventListener('change', function (e) {
+    var cb = e.target.closest('input[type="checkbox"][data-i]');
+    if (!cb || !state.pendingLayoutBatch) return;
+    var i = +cb.dataset.i;
+    state.pendingLayoutBatch.items.forEach(function (item) {
+      if (item.i === i) item.checked = cb.checked;
+    });
+  });
+
+  btnLayoutBatchAll.addEventListener('click', function () {
+    var pend = state.pendingLayoutBatch;
+    if (!pend) return;
+    pend.items.forEach(function (item) { if (!item.error && item.changed) item.checked = true; });
+    renderLayoutBatch();
+  });
+  btnLayoutBatchNone.addEventListener('click', function () {
+    var pend = state.pendingLayoutBatch;
+    if (!pend) return;
+    pend.items.forEach(function (item) { item.checked = false; });
+    renderLayoutBatch();
+  });
+
+  function hideLayoutBatch() {
+    layoutBatchModal.classList.add('hidden');
+    state.pendingLayoutBatch = null;
+  }
+  btnLayoutBatchCancel.addEventListener('click', hideLayoutBatch);
+  layoutBatchModal.addEventListener('click', function (e) {
+    if (e.target === layoutBatchModal) hideLayoutBatch();
+  });
+  btnLayoutBatchApply.addEventListener('click', function () {
+    var pend = state.pendingLayoutBatch;
+    if (!pend || !state.doc) { hideLayoutBatch(); return; }
+    var srcNum = state.doc.cues[pend.src].num;
+    var n = 0;
+    pushUndo('layoutbatch');
+    pend.items.forEach(function (item) {
+      if (item.checked && !item.error && item.changed) {
+        state.doc.cues[item.i].settings = item.newSettings;
+        n++;
+      }
+    });
+    hideLayoutBatch();
+    afterChange(n
+      ? '已把第 ' + srcNum + ' 条的布局套用到 ' + n + ' 条字幕（撤销可整体回退）'
+      : '未选择任何字幕，未做修改');
+  });
+
+  // ---------- 布局工具条 ----------
+
+  layoutOn.addEventListener('change', function () {
+    state.layout.on = layoutOn.checked;
+    saveLayoutCfg();
+    renderLayoutOverlay();
+    setStatus(state.layout.on ? '已开启布局叠加' : '已关闭布局叠加');
+  });
+  safeMargin.addEventListener('change', function () {
+    state.layout.safePct = clamp(Math.round(+safeMargin.value || 0), 0, 25);
+    safeMargin.value = state.layout.safePct;
+    saveLayoutCfg();
+    analyzeAndRender();
+    drawCanvas();
+    setStatus('安全边距 ' + state.layout.safePct + '%（越出安全区的显式定位字幕框会被标出）');
+  });
+  mockAspect.addEventListener('change', function () {
+    state.layout.mockAspect = mockAspect.value;
+    saveLayoutCfg();
+    updateStage();
+    setStatus('模拟画面比例切换为 ' + state.layout.mockAspect);
+  });
+
   // ---------- 初始化 ----------
   function init() {
     loadSettings();
     loadSceneCfg();
+    loadLayoutCfg();
     updateButtons();
     updateUndoButtons();
     updateSnapButtons();
@@ -3963,13 +4616,15 @@
     loopPadBefore.value = state.loop.padBefore;
     loopPadAfter.value = state.loop.padAfter;
     resizeCanvas();
+    updateStage();
     if (window.ResizeObserver) {
       new ResizeObserver(resizeCanvas).observe(timelineWrap);
       new ResizeObserver(function () { if (!wordPanel.classList.contains('hidden')) { resizeWordRuler(); drawWordRuler(); } })
         .observe(wordRulerWrap);
       new ResizeObserver(function () { if (state.compareOn) resizeCompareCanvas(); }).observe(compareView);
+      new ResizeObserver(function () { positionLayoutSvg(); renderLayoutOverlay(); }).observe(stageBox);
     } else {
-      window.addEventListener('resize', resizeCanvas);
+      window.addEventListener('resize', function () { resizeCanvas(); positionLayoutSvg(); renderLayoutOverlay(); });
     }
     updatePlayUI();
     checkMediaMark();

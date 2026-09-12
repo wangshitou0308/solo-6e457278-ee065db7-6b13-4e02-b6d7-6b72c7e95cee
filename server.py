@@ -90,6 +90,62 @@ cue-6
 改动<00:00:20.800>区间时<00:00:21.600>比较<00:00:22.200>两种<00:00:22.800>方案
 """
 
+# 内置 WebVTT 布局示例：REGION 块 + line/position/size/align/vertical/region 设置，
+# 并故意保留区域不存在、值越界、键重复、组合冲突与同时刻遮挡 / 方向冲突，
+# 便于首次体验画面布局编辑与问题定位（无需媒体，模拟画布即可预览）。
+SAMPLE_VTT_LAYOUT = """WEBVTT
+Kind: captions
+
+REGION
+id:top
+width:60%
+lines:2
+regionanchor:50%,0%
+viewportanchor:50%,8%
+scroll:up
+
+REGION
+id:bottom
+width:80%
+lines:2
+regionanchor:50%,100%
+viewportanchor:50%,92%
+
+NOTE 本示例用于演示画面布局编辑（REGION / line / position / size / align / vertical）
+
+lay-1
+00:00:00.500 --> 00:00:03.500 region:bottom
+区域字幕：位置由 REGION 块决定
+
+lay-2
+00:00:04.000 --> 00:00:07.000 line:12% position:20% size:60% align:start
+显式布局：靠上偏左，可拖动调整
+
+lay-3
+00:00:06.500 --> 00:00:09.500 line:30% position:75% size:45% align:end custom:keep-me
+与上一条同时出现，未知设置 custom:keep-me 原样保留
+
+lay-4
+00:00:10.000 --> 00:00:14.000 vertical:rl line:92% size:70%
+竖排字幕示例从右往左排
+
+lay-5
+00:00:12.000 --> 00:00:15.500 line:60% position:50% size:50%
+横排与竖排同时出现触发方向冲突
+
+lay-6
+00:00:16.000 --> 00:00:19.000 region:ghost position:10%
+引用的区域不存在且与 position 冲突（保留原文不擅自改写）
+
+lay-7
+00:00:19.500 --> 00:00:22.000 size:150% align:middle align:start
+值越界与键重复示例（保留原文不擅自改写）
+
+lay-8
+00:00:22.500 --> 00:00:25.000 line:80% position:25%,line-right size:20%
+右边缘锚定：position 带 line-right 对齐
+"""
+
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -206,6 +262,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({
                     "filename": "示例-逐词时间码.vtt",
                     "content": SAMPLE_VTT,
+                })
+            if kind == "layout":
+                return self._send_json({
+                    "filename": "示例-画面布局.vtt",
+                    "content": SAMPLE_VTT_LAYOUT,
                 })
             return self._send_json({
                 "filename": "示例字幕.srt",

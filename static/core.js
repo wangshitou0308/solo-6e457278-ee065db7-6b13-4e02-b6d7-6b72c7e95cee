@@ -1959,6 +1959,13 @@
     return { v: parseFloat(m[1]), pct: !!m[2], align: m[3] || 'start' };
   }
 
+  // position 值："25%" / "25%,line-right" → {v, align(可空)}；非法 null
+  function parsePositionValue(v) {
+    var m = /^(-?\d+(?:\.\d+)?)%(?:,(line-left|line-right|center|start|end))?$/.exec(String(v).trim());
+    if (!m) return null;
+    return { v: parseFloat(m[1]), align: m[2] || null };
+  }
+
   // 单个 cue 设置值校验：返回错误文案或 null（未知键不校验，原样保留）
   function validateCueSetting(key, value) {
     switch (key) {
@@ -2133,6 +2140,15 @@
     if (align === 'end' || align === 'right') return len;
     return 0;
   }
+  // position 锚点偏移：显式位置对齐（line-left/line-right/center/start/end）优先，
+  // 未给出时按文本对齐推导（start/left→0，center→一半，end/right→全部）。
+  // 例如 position:25%,line-right 表示字幕框右边缘落在 25% 处。
+  function positionAnchorOffset(posAlign, textAlign, len) {
+    if (!posAlign) return alignOffset(textAlign, len);
+    if (posAlign === 'center') return len / 2;
+    if (posAlign === 'line-right' || posAlign === 'end') return len;
+    return 0;   // line-left / start
+  }
 
   // 计算一条 cue 在画面上的字幕框（百分比坐标）。
   // opts: { regions, lineHeightPct }
@@ -2169,12 +2185,13 @@
     }
     var size = map.size !== undefined ? parsePct(map.size) : 100;
     if (size === null) size = 100;
-    var pos = map.position !== undefined ? parsePct(map.position) : null;
-    if (pos === null) pos = defaultPositionForAlign(align);
+    var posParsed = map.position !== undefined ? parsePositionValue(map.position) : null;
+    var pos = posParsed ? posParsed.v : defaultPositionForAlign(align);
+    var posAlign = posParsed ? posParsed.align : null;
     var line = map.line !== undefined ? parseLineValue(map.line) : null;
     if (!vertical) {
       var w = size, h = nLines * lh;
-      var x = pos - alignOffset(align, w);
+      var x = pos - positionAnchorOffset(posAlign, align, w);
       var y;
       if (!line) y = 100 - h;                 // 默认贴底
       else if (line.pct) y = line.v - alignOffset(line.align, h);
@@ -2184,7 +2201,7 @@
     }
     // 竖排：size 为高度，position 为纵向锚点，line 为横向锚点
     var h3 = size, w3 = nLines * lh;
-    var y3 = pos - alignOffset(align, h3);
+    var y3 = pos - positionAnchorOffset(posAlign, align, h3);
     var x3;
     if (!line) x3 = vertical === 'rl' ? 100 - w3 : 0;   // rl 默认靠右，lr 默认靠左
     else if (line.pct) x3 = line.v - alignOffset(line.align, w3);
@@ -2200,8 +2217,8 @@
   }
 
   // 由字幕框反推 line/position/size 更新值（拖动 / 缩放时调用，不修改输入）。
-  // 锚点换算遵循 computeCueBox 的同一套规则：position 按 align 锚定，
-  // line 写成百分比形式并沿用原有 line 对齐（无则按 start）。
+  // 锚点换算遵循 computeCueBox 的同一套规则：position 按其位置对齐锚定
+  // （line-right 等后缀原样保留），line 写成百分比形式并沿用原有 line 对齐。
   function boxToSettings(cue, box) {
     var p = parseCueSettings(cue.settings);
     var map = tokenMap(p.tokens);
@@ -2209,14 +2226,17 @@
     var vertical = (map.vertical === 'rl' || map.vertical === 'lr') ? map.vertical : null;
     var line = map.line !== undefined ? parseLineValue(map.line) : null;
     var la = line ? line.align : 'start';
+    var posParsed = map.position !== undefined ? parsePositionValue(map.position) : null;
+    var posAlign = posParsed ? posParsed.align : null;
+    var posSuffix = posAlign ? ',' + posAlign : '';
     var updates = {};
     if (!vertical) {
       updates.size = fmtPct(box.w);
-      updates.position = fmtPct(box.x + alignOffset(align, box.w));
+      updates.position = fmtPct(box.x + positionAnchorOffset(posAlign, align, box.w)) + posSuffix;
       updates.line = fmtPct(box.y + alignOffset(la, box.h));
     } else {
       updates.size = fmtPct(box.h);
-      updates.position = fmtPct(box.y + alignOffset(align, box.h));
+      updates.position = fmtPct(box.y + positionAnchorOffset(posAlign, align, box.h)) + posSuffix;
       updates.line = fmtPct(box.x + alignOffset(la, box.w));
     }
     return updates;
@@ -2398,6 +2418,7 @@
     parseCueSettings: parseCueSettings, validateCueSetting: validateCueSetting,
     parseRegionBlock: parseRegionBlock, validateRegionSetting: validateRegionSetting,
     tokenMap: tokenMap, parsePct: parsePct, parseLineValue: parseLineValue,
+    parsePositionValue: parsePositionValue, positionAnchorOffset: positionAnchorOffset,
     parseAnchorValue: parseAnchorValue, fmtPct: fmtPct,
     analyzeCueSettings: analyzeCueSettings, analyzeLayoutSettings: analyzeLayoutSettings,
     computeCueBox: computeCueBox, boxToSettings: boxToSettings,

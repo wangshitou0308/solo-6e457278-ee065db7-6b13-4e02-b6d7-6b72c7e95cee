@@ -113,7 +113,9 @@
       const timeLine = fmtMs(c.start, format) + ' --> ' + fmtMs(c.end, format) +
         (format === 'vtt' && c.settings ? ' ' + c.settings : '');
       const head = (format === 'vtt' && c.autoNum) ? '' : num + NL;
-      return head + timeLine + NL + c.lines.join(NL);
+      // 逐词时间码只写入 WebVTT：导出 SRT 时剥去内联时间戳标签（其余标签 / 实体保留）
+      const outLines = format === 'vtt' ? c.lines : stripWordTimestamps(c.lines);
+      return head + timeLine + NL + outLines.join(NL);
     });
     if (format === 'vtt') {
       const header = (doc.header && doc.header.trim()) ? doc.header.trim() : 'WEBVTT';
@@ -1400,7 +1402,8 @@
   }
 
   // 细化：在候选区间的细采样序列中定位变化最大的相邻帧对，
-  // 切点取后一帧时间；返回 {t, score}，样本不足时返回 null。
+  // 切点取后一帧时间；返回 {t, score}。样本不足、或相邻差异全为零
+  // （细采样未覆盖到变化后的帧）时返回 null——零差异不是真实切点。
   function refineCutWindow(fineSamples, lumWeight) {
     if (!fineSamples || fineSamples.length < 2) return null;
     var best = -1, bestScore = -1;
@@ -1408,7 +1411,7 @@
       var s = metricsDelta(fineSamples[i - 1].metrics, fineSamples[i].metrics, lumWeight);
       if (s > bestScore) { bestScore = s; best = i; }
     }
-    if (best < 0) return null;
+    if (best < 0 || bestScore <= 0) return null;
     return { t: fineSamples[best].t, score: bestScore };
   }
 
@@ -1516,6 +1519,390 @@
     return { changes: changes, skipped: skipped };
   }
 
+  // ---------- WebVTT 逐词时间码（inline timestamp） ----------
+  //
+  // WebVTT cue 文本中可内嵌时间戳，例如：
+  //   <v 小明>欢迎<00:00:01.200>来到<00:00:01.600>校准台
+  // 标签（<v>/<c>/<ruby>/<i>…）、实体（&amp;…）、英文单词与数字串均为
+  // 不可拆单元，不能在中间插入时间戳。解析只报告问题，绝不擅自修正。
+
+  var TS_OPEN = /^<(?:\d{1,3}:)?\d{1,2}:\d{2}[.,]\d{1,3}>$/;
+
+  // 把一条 cue 的全部文本行切成单元：
+  //   {s, type, line}  type ∈ 'ts' | 'tag' | 'entity' | 'word' | 'space' | 'char'
+  // 词元轨道可标记 / 高亮的“正文单元”为 entity / word / char。
+  function tokenizeCueText(lines) {
+    var text = lines.join('\n');
+    var re = /<[^>]*>|&(?:#[0-9]{1,7}|#x[0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});|[\t\n\r   　]|[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*|(?:[\uD800-\uDBFF][\uDC00-\uDFFF])|./g;
+    var toks = [], m, line = 0;
+    while ((m = re.exec(text)) !== null) {
+      var s = m[0], type;
+      if (s.charAt(0) === '<') {
+        if (TS_OPEN.test(s)) type = 'ts';
+        else type = 'tag';
+      } else if (s.charAt(0) === '&') type = 'entity';
+      else if (/^\s+$/.test(s) || s === ' ' || s === ' ' || s === '　') type = 'space';
+      else if (/^[A-Za-z0-9]/.test(s)) type = 'word';
+      else type = 'char';
+      var nl = 0;
+      for (var k = 0; k < s.length; k++) if (s.charCodeAt(k) === 10) nl++;
+      toks.push({ s: s, type: type, line: line, off: m.index });
+      line += nl;
+    }
+    return toks;
+  }
+
+  // 解析时间戳标签内部文本（接受逗号小数，SRT 手工文本里也能定位）
+  function timestampInside(tagText) {
+    var inner = String(tagText).slice(1, -1).trim();
+    if (!TS_OPEN.test('<' + inner + '>')) return null;
+    return parseTimecode(inner);
+  }
+
+  function isContentTok(t) { return t.type === 'entity' || t.type === 'word' || t.type === 'char'; }
+
+  // 解析一条 cue 的词元轨道：
+  //   { toks, marks:[{tok, time, tagTok, line, col, len}], errors:[{kind,...}] }
+  // 不修改 cue。错误类型：
+  //   badtime    时间戳格式错误（定位到 cue、行列与文本偏移）
+  //   order      时间戳未严格递增
+  //   outrange   时间戳超出 cue 区间 [start, end]
+  function parseCueWords(cue) {
+    var toks = tokenizeCueText(cue.lines || []);
+    var fullText = (cue.lines || []).join('\n');
+    var marks = [], errors = [], lastTime = null;
+    function lineCol(off) {
+      var line = 1, col = 1;
+      for (var k = 0; k < off && k < fullText.length; k++) {
+        if (fullText.charCodeAt(k) === 10) { line++; col = 1; } else col++;
+      }
+      return { line: line, col: col };
+    }
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (t.type !== 'tag' && t.type !== 'ts') continue;
+      if (t.type === 'tag') {
+        // 形似时间戳的非法标签（仅由数字与 : . , 空格组成且含数字）：
+        // 报格式错误并给出具体行列，不当作普通标签悄悄吞掉
+        var inner = t.s.slice(1, -1).trim();
+        if (/^[\d\s:.,]+$/.test(inner) && /\d/.test(inner) && !TS_OPEN.test(t.s)) {
+          var p1 = lineCol(t.off);
+          errors.push({
+            kind: 'badtime', msg: '时间戳格式错误「' + t.s + '」（第 ' + p1.line + ' 行第 ' + p1.col +
+              ' 字），应为 <HH:MM:SS.mmm>，未擅自修改',
+            off: t.off, len: t.s.length, line: p1.line, col: p1.col,
+          });
+        }
+        continue;
+      }
+      var tm = timestampInside(t.s);
+      if (tm === null) {
+        var p2 = lineCol(t.off);
+        errors.push({
+          kind: 'badtime', msg: '时间戳格式错误「' + t.s + '」（第 ' + p2.line + ' 行第 ' + p2.col + ' 字）',
+          off: t.off, len: t.s.length, line: p2.line, col: p2.col,
+        });
+        continue;
+      }
+      if (lastTime !== null && tm <= lastTime) {
+        var p3 = lineCol(t.off);
+        errors.push({
+          kind: 'order', msg: '时间戳 ' + fmtMs(tm, 'srt') + ' 未严格递增（不晚于上一个 ' +
+            fmtMs(lastTime, 'srt') + '，第 ' + p3.line + ' 行第 ' + p3.col + ' 字），未擅自调整',
+          off: t.off, len: t.s.length, line: p3.line, col: p3.col, time: tm, prev: lastTime,
+        });
+      }
+      if (tm < cue.start || tm > cue.end) {
+        var p4 = lineCol(t.off);
+        errors.push({
+          kind: 'outrange', msg: '时间戳 ' + fmtMs(tm, 'srt') + ' 超出该字幕区间 ' +
+            fmtMs(cue.start, 'srt') + ' ~ ' + fmtMs(cue.end, 'srt') +
+            '（第 ' + p4.line + ' 行第 ' + p4.col + ' 字），未擅自调整',
+          off: t.off, len: t.s.length, line: p4.line, col: p4.col, time: tm,
+        });
+      }
+      // 找它后面的第一个正文单元（标签 / 空白不附时间戳；遇到下一个时间戳即停止）
+      var target = -1;
+      for (var j = i + 1; j < toks.length; j++) {
+        if (toks[j].type === 'ts') break;
+        if (isContentTok(toks[j])) { target = j; break; }
+      }
+      if (target >= 0) {
+        var p5 = lineCol(toks[target].off);
+        marks.push({
+          tok: target, time: tm, tagTok: i,
+          line: p5.line, col: p5.col, off: toks[target].off,
+        });
+      }
+      lastTime = tm;
+    }
+    return { toks: toks, marks: marks, errors: errors };
+  }
+
+  // 全文档逐词时间戳校验，返回带 cue 下标准备给界面定位的错误列表
+  function analyzeWordTimings(cues) {
+    var out = [];
+    cues.forEach(function (c, i) {
+      parseCueWords(c).errors.forEach(function (e) {
+        out.push({ cue: i, kind: e.kind, msg: e.msg, off: e.off, len: e.len,
+          line: e.line, col: e.col });
+      });
+    });
+    return out;
+  }
+
+  // 仅剥离合法的逐词时间戳标签（SRT 导出用：逐词时间码只写入 WebVTT 导出结果）。
+  // 形似时间戳的非法标签原样保留，继续由错误检查提示人工处理。
+  function stripWordTimestampsLine(line) {
+    return String(line).replace(/<[^>]*>/g, function (tag) {
+      return TS_OPEN.test(tag) ? '' : tag;
+    });
+  }
+  function stripWordTimestamps(lines) { return lines.map(stripWordTimestampsLine); }
+
+  // 由 token 序列重建文本行（\n 单元恢复换行）
+  function rebuildLines(toks) {
+    var lines = [''];
+    toks.forEach(function (t) {
+      if (t.type === 'space' && t.s.indexOf('\n') !== -1) {
+        var parts = t.s.split('\n');
+        lines[lines.length - 1] += parts[0];
+        for (var k = 1; k < parts.length; k++) lines.push(parts[k]);
+      } else {
+        lines[lines.length - 1] += t.s;
+      }
+    });
+    return lines;
+  }
+
+  // 判断 toks[i] 是否直接邻接另一个英文/数字词单元（实体夹在单词中间时
+  // 不可单独标记，否则会把 AT&amp;T 这类词拆成两半）
+  function adjacentWord(toks, i) {
+    var j;
+    for (j = i - 1; j >= 0; j--) {
+      if (toks[j].type === 'word') return true;
+      if (toks[j].type === 'char' || toks[j].type === 'ts') break;
+    }
+    for (j = i + 1; j < toks.length; j++) {
+      if (toks[j].type === 'word') return true;
+      if (toks[j].type === 'char' || toks[j].type === 'ts') break;
+    }
+    return false;
+  }
+
+  // 在 token 下标 tokIndex 处设置词元起点 time（ms）。已有同一词元的时间戳则改写，
+  // 否则把新时间戳插到该正文单元正前方。WebVTT 规定时间戳必须位于标签之外，
+  // 因此不跨过紧贴它的标签（标签仍属于上一词元的样式范围）。
+  // 返回 {lines}；校验不通过返回 {error}。绝不修改输入。
+  function setWordTime(cue, tokIndex, time) {
+    var w = parseCueWords(cue);
+    var toks = w.toks;
+    if (tokIndex < 0 || tokIndex >= toks.length || !isContentTok(toks[tokIndex])) {
+      return { error: '该单元不是可标记的词元（标签、空白不能标记）' };
+    }
+    if (toks[tokIndex].type === 'entity' && adjacentWord(toks, tokIndex)) {
+      return { error: '实体「' + toks[tokIndex].s + '」位于英文单词或数字串中间，' +
+        '不能单独标记（不可拆单元）' };
+    }
+    if (!(time >= cue.start && time <= cue.end)) {
+      return { error: '词元起点 ' + fmtMs(Math.round(time), 'srt') + ' 必须位于字幕区间 ' +
+        fmtMs(cue.start, 'srt') + ' ~ ' + fmtMs(cue.end, 'srt') + ' 内' };
+    }
+    var existing = w.marks.find(function (mk) { return mk.tok === tokIndex; });
+    if (existing) {
+      toks[existing.tagTok].s = '<' + fmtMs(Math.round(time), 'vtt') + '>';
+    } else {
+      toks.splice(tokIndex, 0, {
+        s: '<' + fmtMs(Math.round(time), 'vtt') + '>',
+        type: 'ts', line: toks[tokIndex].line, off: -1,
+      });
+    }
+    // 严格递增校验
+    var times = [];
+    for (var i = 0; i < toks.length; i++) {
+      if (toks[i].type === 'ts') times.push(timestampInside(toks[i].s));
+    }
+    for (i = 1; i < times.length; i++) {
+      if (times[i] <= times[i - 1]) {
+        return { error: '词元起点必须严格递增：' + fmtMs(times[i - 1], 'srt') + ' → ' +
+          fmtMs(times[i], 'srt') + ' 不合法（未应用，请先调整前一个标记）' };
+      }
+    }
+    return { lines: rebuildLines(toks) };
+  }
+
+  // 删除指定词元的时间戳标记。返回 {lines} 或 {error}。
+  function clearWordTime(cue, tokIndex) {
+    var w = parseCueWords(cue);
+    var mk = w.marks.find(function (m) { return m.tok === tokIndex; });
+    if (!mk) return { error: '该词元没有时间戳标记' };
+    w.toks.splice(mk.tagTok, 1);
+    return { lines: rebuildLines(w.toks) };
+  }
+
+  // 删除该 cue 的全部逐词时间戳（保留正文与其它标签）
+  function clearAllWordTimes(cue) {
+    return { lines: rebuildLines(parseCueWords(cue).toks.filter(function (t) { return t.type !== 'ts'; })) };
+  }
+
+  // 修改 cue 起止区间时的两种词元方案（不修改输入）：
+  //   absolute：保持各词元绝对时间不变；区间越界即不可用
+  //   scale：按新区间线性映射；旧区间非正时长时不可用
+  // 返回 { absolute:{ok, reason, marks:[{time}]}, scale:{...}, nMarks }
+  function planWordBounds(cue, newStart, newEnd) {
+    var w = parseCueWords(cue);
+    var times = w.marks.map(function (m) { return m.time; });
+    var res = { nMarks: times.length, nErrors: w.errors.length };
+    res.absolute = { ok: times.every(function (t) { return t >= newStart && t <= newEnd; }) };
+    if (!times.length) res.absolute.ok = true;
+    if (!res.absolute.ok) {
+      var bad = times.find(function (t) { return t < newStart || t > newEnd; });
+      res.absolute.reason = '存在词元标记 ' + fmtMs(bad, 'srt') + ' 落在新区间 ' +
+        fmtMs(newStart, 'srt') + ' ~ ' + fmtMs(newEnd, 'srt') + ' 之外，不能保持绝对时间';
+    }
+    var oldDur = cue.end - cue.start;
+    if (oldDur > 0) {
+      var mapped = times.map(function (t) {
+        return Math.round(newStart + (t - cue.start) * (newEnd - newStart) / oldDur);
+      });
+      var mono = true;
+      for (var i = 1; i < mapped.length; i++) if (mapped[i] <= mapped[i - 1]) mono = false;
+      var inside = mapped.every(function (t) { return t >= newStart && t <= newEnd; });
+      res.scale = { ok: mono && inside, marks: mapped,
+        reason: (!mono ? '缩放后词元时间不再严格递增' : !inside ? '缩放后仍有标记越界' : '') };
+    } else {
+      res.scale = { ok: false, marks: [], reason: '原字幕区间时长为 0，无法按比例缩放' };
+    }
+    res.absolute.marks = times.slice();
+    return res;
+  }
+
+  // 按方案重写 cue 内全部时间戳标签（绝对方案不改文本）。
+  // mode='scale' 时按映射表（与 parseCueWords 的 marks 同序）替换；
+  // mode='translate' 时整体平移 deltaMs（整块移动用，不做比例变换）。
+  // 返回 {lines}；产生非递增 / 越界时返回 {error}。
+  function rewriteWordTimes(cue, mode, mappedTimes, deltaMs, bounds) {
+    var w = parseCueWords(cue);
+    var toks = w.toks;
+    var tsIdx = 0, newTimes = [];
+    for (var i = 0; i < toks.length; i++) {
+      if (toks[i].type !== 'ts') continue;
+      var oldTm = timestampInside(toks[i].s);
+      var nt;
+      if (mode === 'scale') nt = mappedTimes[tsIdx];
+      else nt = oldTm + (deltaMs || 0);
+      nt = Math.round(nt);
+      toks[i].s = '<' + fmtMs(nt, 'vtt') + '>';
+      newTimes.push(nt);
+      tsIdx++;
+    }
+    for (i = 1; i < newTimes.length; i++) {
+      if (newTimes[i] <= newTimes[i - 1]) {
+        return { error: '调整后词元时间 ' + fmtMs(newTimes[i - 1], 'srt') + ' → ' +
+          fmtMs(newTimes[i], 'srt') + ' 不再严格递增，未应用' };
+      }
+    }
+    if (bounds) {
+      var lo = bounds.start !== undefined ? bounds.start : bounds.from;
+      var hi = bounds.end !== undefined ? bounds.end : bounds.to;
+      var out = newTimes.some(function (t) { return t < lo || t > hi; });
+      if (out) {
+        return { error: '调整后存在词元标记超出字幕区间 ' + fmtMs(lo, 'srt') +
+          ' ~ ' + fmtMs(hi, 'srt') + '，未应用' };
+      }
+    }
+    return { lines: rebuildLines(toks) };
+  }
+
+  // 整块平移（保持相对节奏；bounds 为平移后应落在的字幕新区间）
+  function translateWordTimes(cue, deltaMs, bounds) {
+    return rewriteWordTimes(cue, 'translate', null, deltaMs, bounds);
+  }
+  // 按新区间比例缩放（调用方应先用 planWordBounds 确认 scale.ok）
+  function scaleWordTimes(cue, newStart, newEnd) {
+    var plan = planWordBounds(cue, newStart, newEnd);
+    if (!plan.scale.ok) return { error: plan.scale.reason };
+    return rewriteWordTimes(cue, 'scale', plan.scale.marks, 0,
+      { start: newStart, end: newEnd });
+  }
+
+  // 播放头处应高亮的词元下标（最后一个 t ≤ playhead 的标记）；无则 -1
+  function activeWord(cue, playheadMs) {
+    var w = parseCueWords(cue);
+    var idx = -1;
+    w.marks.forEach(function (m) { if (m.time <= playheadMs) idx = m.tok; });
+    return idx;
+  }
+
+  // ---------- 预览 HTML（白名单标签渲染为真实 HTML，未知标签转义；按播放头高亮当前词元） ----------
+  var VTT_VOICE_RE = /^<v(?:\s+([^>]*?))?\s*>$/i;
+  var VTT_CLASS_RE = /^<c(?:\.[0-9A-Za-z_-]+)*(?:\s+[^>]*)?>$/i;
+  var VTT_LANG_RE = /^<lang(?:\s+([0-9A-Za-z-]+))?>$/i;
+  var SAFE_TAG_RE = /^<\/?(i|b|u|ruby|rt|rp)(?:\s+[^<>]*)?>$/i;
+
+  function escHtml(s) {
+    return String(s).replace(/[&<>"]/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch];
+    });
+  }
+
+  function decodeEntity(s) {
+    var m;
+    if ((m = /^#(\d+);$/.exec(s))) return String.fromCodePoint(Math.min(+m[1], 0x10FFFF));
+    if ((m = /^#x([0-9a-fA-F]+);$/.exec(s))) {
+      return String.fromCodePoint(Math.min(parseInt(m[1], 16), 0x10FFFF));
+    }
+    var named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+    var name = /^&([a-zA-Z][a-zA-Z0-9]*);$/.exec(s);
+    return name && named[name[1].toLowerCase()] !== undefined
+      ? named[name[1].toLowerCase()] : s;
+  }
+
+  // 返回 {html, activeTok}。只把白名单标签渲染成真实 HTML；
+  // <v>/<c>/<lang> 转为带样式的 span；未知标签整体转义，绝不注入。
+  function cuePreviewHtml(cue, playheadMs) {
+    var w = parseCueWords(cue);
+    var active = playheadMs === undefined || playheadMs === null ? -1 : activeWord(cue, playheadMs);
+    var html = '', depth = 0;
+    function wrapActive(i, s) {
+      return i === active ? '<span class="w-active">' + s + '</span>' : s;
+    }
+    w.toks.forEach(function (t, i) {
+      if (t.type === 'ts') return;
+      if (t.type === 'entity') { html += wrapActive(i, escHtml(decodeEntity(t.s))); return; }
+      if (t.type === 'space') {
+        html += t.s.indexOf('\n') !== -1 ? t.s.replace(/\n/g, '<br>') : escHtml(t.s);
+        return;
+      }
+      var mv, ml;
+      if (t.type === 'tag') {
+        var lower = t.s.toLowerCase();
+        if (lower === '</v>' || lower === '</c>' || lower === '</lang>') {
+          if (depth > 0) { html += '</span>'; depth--; }
+          return;
+        }
+        if (SAFE_TAG_RE.test(t.s)) { html += t.s; return; }
+        if ((mv = VTT_VOICE_RE.exec(t.s))) {
+          var who = (mv[1] || '').trim();
+          html += '<span class="vtt-voice"' + (who ? ' title="' + escHtml(who) + '"' : '') + '>';
+          depth++;
+          return;
+        }
+        if ((ml = VTT_LANG_RE.exec(t.s))) {
+          html += '<span class="vtt-lang"' + (ml[1] ? ' title="' + escHtml(ml[1]) + '"' : '') + '>';
+          depth++;
+          return;
+        }
+        if (VTT_CLASS_RE.test(t.s)) { html += '<span class="vtt-class">'; depth++; return; }
+        html += escHtml(t.s);   // 未知标签不渲染为真实 HTML
+        return;
+      }
+      // 正文单元（word / char）
+      html += wrapActive(i, escHtml(t.s));
+    });
+    return { html: html, activeTok: active };
+  }
+
   // ---------- 草稿键 ----------
 
   // FNV-1a 简易哈希，用于生成草稿键
@@ -1553,6 +1940,14 @@
     findCutCandidates: findCutCandidates, refineCutWindow: refineCutWindow,
     nearestCut: nearestCut, analyzeCutConflicts: analyzeCutConflicts,
     planCutSnap: planCutSnap,
+    // WebVTT 逐词时间码
+    tokenizeCueText: tokenizeCueText, parseCueWords: parseCueWords,
+    analyzeWordTimings: analyzeWordTimings, isContentTok: isContentTok,
+    setWordTime: setWordTime, clearWordTime: clearWordTime, clearAllWordTimes: clearAllWordTimes,
+    planWordBounds: planWordBounds, scaleWordTimes: scaleWordTimes,
+    translateWordTimes: translateWordTimes, rewriteWordTimes: rewriteWordTimes,
+    stripWordTimestamps: stripWordTimestamps, cuePreviewHtml: cuePreviewHtml,
+    activeWord: activeWord, decodeEntity: decodeEntity,
     simpleHash: simpleHash, draftKey: draftKey,
   };
 });

@@ -14,6 +14,7 @@
     <button id="btnImport" title="导入 .srt / .vtt 文件">导入字幕</button>
     <input type="file" id="fileInput" accept=".srt,.vtt,.txt" hidden>
     <button id="btnSample" title="载入内置示例字幕">载入示例</button>
+    <button id="btnSampleVtt" title="载入带逐词时间码的 WebVTT 示例（无需媒体即可体验词元轨道）">VTT 逐词示例</button>
   </div>
 
   <div class="group">
@@ -167,6 +168,27 @@
           <button id="btnFit" title="适配全部 (0)">适配</button>
         </span>
         <span>滚轮缩放 · 拖动色块移动/调整边缘 · 拖动标尺移动播放头 · 空格播放 · 文本框中 Ctrl+Enter 在光标处拆分</span>
+      </div>
+    </div>
+    <div id="wordPanel" class="hidden">
+      <div id="wordPanelHead">
+        <span class="label">词元轨道：</span>
+        <span id="wordPanelCue" class="mono"></span>
+        <span id="wordPanelRange" class="mono muted"></span>
+        <span id="wordPanelCount" class="muted"></span>
+        <span class="grow"></span>
+        <label class="chk" title="播放时按 M 键把当前播放头作为下一个未标记词元的起点">
+          <input type="checkbox" id="wordArmChk" checked> 播放时 M 键顺序标记
+        </label>
+        <button id="btnWordClear" class="mini" title="删除该条全部逐词时间戳（保留正文与标签）">清空标记</button>
+      </div>
+      <div id="wordRulerWrap">
+        <canvas id="wordRuler"></canvas>
+      </div>
+      <div id="wordChips"></div>
+      <div id="wordHint" class="muted">
+        蓝色竖线为已标记词元起点，可直接拖动；播放时按 M 顺序标记下一词；
+        点击词元可输入时间；标签、实体、英文单词与数字串不可拆开；逐词时间码仅写入 VTT 导出。
       </div>
     </div>
     <div id="cueListWrap">
@@ -349,6 +371,41 @@
   </div>
 </div>
 
+<div id="wordBoundsModal" class="hidden">
+  <div id="wordBoundsBox">
+    <h3>改动字幕区间 — 词元时间如何处理？</h3>
+    <p class="muted" id="wordBoundsCue"></p>
+    <table id="wordBoundsTable">
+      <thead>
+        <tr><th>方案</th><th>词元时间</th><th>状态</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+        <tr id="wbRowAbs">
+          <td><b>保持绝对时间</b></td>
+          <td class="muted">词元时间戳不动，仅 cue 起止改变。</td>
+          <td id="wbAbsState"></td>
+          <td><button id="btnWbAbs" class="accent">应用此方案</button></td>
+        </tr>
+        <tr id="wbRowScale">
+          <td><b>按比例缩放</b></td>
+          <td class="muted" id="wbScaleDesc">词元随新区间线性映射。</td>
+          <td id="wbScaleState"></td>
+          <td><button id="btnWbScale" class="accent">应用此方案</button></td>
+        </tr>
+      </tbody>
+    </table>
+    <div id="wordBoundsDiffWrap">
+      <table id="wordBoundsDiff">
+        <thead><tr><th>词元</th><th>原起点</th><th id="wbNewHead">新起点</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="row-end">
+      <button id="btnWbCancel">取消（区间与词元均不改）</button>
+    </div>
+  </div>
+</div>
+
 <div id="cutBatchModal" class="hidden">
   <div id="cutBatchBox">
     <h3>批量吸附切点 — 调整预览</h3>
@@ -371,7 +428,7 @@
 <footer id="statusbar">
   <span id="statusMsg">就绪</span>
   <span class="grow"></span>
-  <span class="muted">快捷键：空格播放 · ←/→ 平移 · [ ] 起点 · ; ' 终点 · , . 吸附播放头 · Shift 大步 · Alt 小步 · 文本框 Ctrl+Enter 拆分 · Ctrl+Z/Y 撤销重做</span>
+  <span class="muted">快捷键：空格播放 · ←/→ 平移 · [ ] 起点 · ; ' 终点 · , . 吸附播放头 · M 顺序标记词元 · Shift 大步 · Alt 小步 · 文本框 Ctrl+Enter 拆分 · Ctrl+Z/Y 撤销重做</span>
 </footer>
 
 <script src="/static/core.js"></script>

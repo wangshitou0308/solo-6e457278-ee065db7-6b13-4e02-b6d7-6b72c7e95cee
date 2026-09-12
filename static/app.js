@@ -8,7 +8,8 @@
 
   // ---------- DOM ----------
   function $(id) { return document.getElementById(id); }
-  var btnImport = $('btnImport'), fileInput = $('fileInput'), btnSample = $('btnSample');
+  var btnImport = $('btnImport'), fileInput = $('fileInput'), btnSample = $('btnSample'),
+    btnSampleVtt = $('btnSampleVtt');
   var btnUndo = $('btnUndo'), btnRedo = $('btnRedo');
   var btnPlay = $('btnPlay'), playTime = $('playTime');
   var searchInput = $('searchInput'), searchCount = $('searchCount');
@@ -75,6 +76,18 @@
     a1: { cue: $('a1Cue'), src: $('a1Src'), dst: $('a1Dst') },
     a2: { cue: $('a2Cue'), src: $('a2Src'), dst: $('a2Dst') },
   };
+  // 逐词时间码
+  var wordPanel = $('wordPanel'), wordPanelCue = $('wordPanelCue'),
+    wordPanelRange = $('wordPanelRange'), wordPanelCount = $('wordPanelCount'),
+    wordArmChk = $('wordArmChk'), btnWordClear = $('btnWordClear'),
+    wordRulerWrap = $('wordRulerWrap'), wordRuler = $('wordRuler'),
+    wordChips = $('wordChips');
+  var wordRulerCtx = wordRuler.getContext('2d');
+  var wordBoundsModal = $('wordBoundsModal'), wordBoundsCue = $('wordBoundsCue'),
+    wbAbsState = $('wbAbsState'), wbScaleState = $('wbScaleState'),
+    wbScaleDesc = $('wbScaleDesc'), btnWbAbs = $('btnWbAbs'), btnWbScale = $('btnWbScale'),
+    btnWbCancel = $('btnWbCancel'), wbNewHead = $('wbNewHead'),
+    wordBoundsDiffBody = document.querySelector('#wordBoundsDiff tbody');
 
   var ctx = canvas.getContext('2d');
 
@@ -86,7 +99,7 @@
   var TYPE_LABEL = {
     cps: '语速', short: '过短', gap: '间隔', overlap: '重叠', order: '时序',
     longline: '超长行', orphan: '孤立标点', toomany: '超行数',
-    'cut-cross': '跨切点', 'cut-near': '近切点',
+    'cut-cross': '跨切点', 'cut-near': '近切点', wordtime: '词元时间戳',
   };
 
   // ---------- 状态 ----------
@@ -132,6 +145,13 @@
     },
     cutDetail: null,                    // {cue, cutIdx} 切点详情弹窗当前条目
     pendingCutSnap: null,               // 批量吸附预览计划
+    // WebVTT 逐词时间码
+    word: {
+      errors: [],                       // analyzeWordTimings 结果（含 cue/行列定位）
+      errorByCue: {},
+      pendingBounds: null,              // 改 cue 区间时的两方案选择弹窗状态
+      editTok: -1,                      // chips 中正在输入时间的 token 下标
+    },
   };
   var rowEls = [];        // 每行 DOM 缓存
   var activeRowIdx = -1;  // 播放头当前所在字幕行
@@ -192,6 +212,7 @@
     renderList();
     afterChange('已撤销');
     syncCompareAfterEdit();
+    renderWordPanel();
   }
   function doRedo() {
     if (!state.doc || !state.redoStack.length) return;
@@ -201,6 +222,7 @@
     renderList();
     afterChange('已重做');
     syncCompareAfterEdit();
+    renderWordPanel();
   }
   function updateUndoButtons() {
     btnUndo.disabled = !state.undoStack.length;
@@ -233,6 +255,9 @@
     state.fileName = fileName;
     state.fileKey = C.draftKey(fileName, text);
     state.selected = -1;
+    wordPanel.classList.add('hidden');
+    wordBoundsModal.classList.add('hidden');
+    state.word.pendingBounds = null;
     if (state.playing) setPlaying(false);
     setPlayhead(0);
     state.undoStack.length = 0;
@@ -369,16 +394,21 @@
         return;
       }
       var field = e.target.dataset.field;
-      pushUndo('edit');
-      if (field === 'start') cue.start = Math.min(ms, cue.end - MIN_DUR);
-      else cue.end = Math.max(ms, cue.start + MIN_DUR);
+      var cue0 = state.doc.cues[i];
+      var ns = field === 'start' ? Math.min(ms, cue0.end - MIN_DUR) : cue0.start;
+      var ne = field === 'end' ? Math.max(ms, cue0.start + MIN_DUR) : cue0.end;
+      if (!requestBoundsChange(i, ns, ne, { label: 'edit' })) {
+        // 存在词元标记：待弹窗选择，输入框先显示目标值，模型未改
+        return;
+      }
       fillRowTimes(i);
-      afterChange('已修改第 ' + cue.num + ' 条时间');
+      afterChange('已修改第 ' + cue0.num + ' 条时间');
     } else if (e.target.matches('textarea')) {
       pushUndo('text');
       cue.lines = e.target.value.split(/\r?\n/);
       while (cue.lines.length > 1 && cue.lines[cue.lines.length - 1] === '') cue.lines.pop();
       afterChange('已修改第 ' + cue.num + ' 条文本');
+      renderWordPanel();
     }
   });
 
@@ -611,6 +641,7 @@
     state.selected = i;
     markSelectedRow();
     updateSnapButtons();
+    renderWordPanel();
     if (opts.center) centerTimelineOn(state.doc.cues[i]);
     if (opts.scroll && rowEls[i]) rowEls[i].scrollIntoView({ block: 'nearest' });
     drawCanvas();
@@ -637,7 +668,8 @@
       .concat(C.analyzeLayout(state.doc.cues, state.settings.maxChars, state.settings.maxLines))
       .concat(state.scene.cuts.length
         ? C.analyzeCutConflicts(state.doc.cues, state.scene.cuts, state.scene.cfg.tol)
-        : []);
+        : [])
+      .concat(C.analyzeWordTimings(state.doc.cues));
     state.problemByCue = {};
     state.problems.forEach(function (p) {
       (state.problemByCue[p.cue] = state.problemByCue[p.cue] || []).push(p.type);
@@ -685,6 +717,9 @@
         if (p.type === 'cut-cross' || p.type === 'cut-near') {
           // 切点问题：展示切点前后缩略图并同步定位媒体
           openCutDetail(p.cue, p.cutIdx);
+        } else if (p.type === 'wordtime') {
+          // 逐词时间戳错误：展开词元轨道并定位到具体行列
+          locateWordError(p);
         } else {
           setStatus('定位到第 ' + cue.num + ' 条');
         }
@@ -959,6 +994,18 @@
       var ns = Math.max(0, drag.origStart + dt);
       cue.start = ns;
       cue.end = ns + dur;
+      // 整块平移：词元标记随之平移（保持相对节奏），越界则回退并提示
+      var tr = C.translateWordTimes(cue, ns - drag.origStart,
+        { start: cue.start, end: cue.end });
+      if (!tr.error) {
+        cue.lines = tr.lines;
+        drag.wordTranslated = true;
+      } else {
+        cue.start = drag.origStart; cue.end = drag.origEnd;
+        setStatus('无法继续平移：' + tr.error);
+        drag.moved = false;
+        return;
+      }
     } else if (drag.mode === 'resize-l') {
       cue.start = clamp(drag.origStart + dt, 0, cue.end - MIN_DUR);
     } else if (drag.mode === 'resize-r') {
@@ -967,15 +1014,25 @@
     fillRowTimes(drag.idx);
     analyzeAndRender();
     drawCanvas();
+    refreshWordPanelLive();
   });
 
   window.addEventListener('mouseup', function () {
     if (!drag) return;
     var wasMoved = drag.moved && drag.undoPushed;
-    var idx = drag.idx;
+    var d = drag;
     drag = null;
-    if (wasMoved) {
-      var cue = state.doc.cues[idx];
+    if (!wasMoved) return;
+    var cue = state.doc.cues[d.idx];
+    var changedBounds = d.mode !== 'move' &&
+      (cue.start !== d.origStart || cue.end !== d.origEnd);
+    if (changedBounds && cueHasWordMarks(cue)) {
+      // 起止被拖动且含词元标记：弹出两方案选择；取消则整体回退（含撤销栈）
+      requestBoundsChange(d.idx, cue.start, cue.end, {
+        label: 'drag', alreadyMutated: true,
+        orig: { start: d.origStart, end: d.origEnd },
+      });
+    } else {
       afterChange('已调整第 ' + cue.num + ' 条：' +
         C.fmtMs(cue.start, 'srt') + ' → ' + C.fmtMs(cue.end, 'srt'));
     }
@@ -1080,28 +1137,11 @@
     if (state.media.ready) {
       mediaClock.textContent = C.fmtShort(state.playheadMs) + ' / ' + C.fmtShort(state.media.duration);
     }
-    updateNowCue();
+    updateWordPreview();
+    refreshWordPanelLive();
     if (state.compareOn) drawCompareCanvas();
   }
-  // 当前字幕预览（媒体条 + 视频叠加层）
-  var lastNowCue = null;
-  function updateNowCue() {
-    var txt = '';
-    if (state.doc) {
-      var list = state.doc.cues;
-      for (var i = 0; i < list.length; i++) {
-        if (state.playheadMs >= list[i].start && state.playheadMs < list[i].end) {
-          txt = list[i].lines.join(' ');
-          break;
-        }
-      }
-    }
-    if (txt === lastNowCue) return;
-    lastNowCue = txt;
-    nowCueText.textContent = txt || (state.doc ? '（播放头处无字幕）' : '');
-    nowCueText.classList.toggle('on', !!txt);
-    nowCueOverlay.textContent = txt;
-  }
+  // 当前字幕预览改由 updateWordPreview() 统一渲染（保留标签并逐词高亮）
   function highlightActiveRow() {
     var idx = -1;
     var list = cues();
@@ -1159,9 +1199,11 @@
     btnUnloadMedia.classList.remove('hidden');
     hideMediaBanner();
     try { localStorage.setItem(MEDIA_MARK_KEY, JSON.stringify({ name: p.name })); } catch (e) {}
-    // 区间检测的默认终点跟随新媒体时长
-    if (p.isVideo && state.media.duration > 0) {
+    // 区间检测的默认终点跟随新媒体时长（Infinity 时长留空，检测时解析后再回填）
+    if (p.isVideo && isFinite(state.media.duration) && state.media.duration > 0) {
       sceneTo.value = (state.media.duration / 1000).toFixed(1);
+    } else if (p.isVideo) {
+      sceneTo.value = '';
     }
     updateSceneButtons();
     setPlayhead(0);
@@ -1280,9 +1322,9 @@
     if (!state.doc || state.selected < 0) return;
     var cue = state.doc.cues[state.selected];
     var t = Math.round(state.playheadMs);
-    pushUndo('snap');
-    if (field === 'start') cue.start = clamp(t, 0, cue.end - MIN_DUR);
-    else cue.end = Math.max(t, cue.start + MIN_DUR);
+    var ns = field === 'start' ? clamp(t, 0, cue.end - MIN_DUR) : cue.start;
+    var ne = field === 'end' ? Math.max(t, cue.start + MIN_DUR) : cue.end;
+    if (!requestBoundsChange(state.selected, ns, ne, { label: 'snap' })) return;
     fillRowTimes(state.selected);
     afterChange('已将第 ' + cue.num + ' 条' + (field === 'start' ? '起点' : '终点') +
       ' 吸附到播放头 ' + C.fmtMs(t, 'srt'));
@@ -1385,6 +1427,7 @@
     pushUndo('anchorsync');
     res.changes.forEach(function (ch) {
       var cue = state.doc.cues[ch.i];
+      adaptCueWordsForBatch(cue, ch.oldStart, ch.oldEnd, ch.newStart, ch.newEnd);
       cue.start = ch.newStart;
       cue.end = ch.newEnd;
     });
@@ -1401,17 +1444,25 @@
   function nudgeSelected(mode, dir, step) {
     if (!state.doc || state.selected < 0) return;
     var cue = state.doc.cues[state.selected];
-    pushUndo('nudge');
     var d = dir * step;
+    var ns, ne;
     if (mode === 'both') {
       var dur = cue.end - cue.start;
-      cue.start = Math.max(0, cue.start + d);
-      cue.end = cue.start + dur;
+      ns = Math.max(0, cue.start + d);
+      ne = ns + dur;
     } else if (mode === 'start') {
-      cue.start = clamp(cue.start + d, 0, cue.end - MIN_DUR);
+      ns = clamp(cue.start + d, 0, cue.end - MIN_DUR);
+      ne = cue.end;
     } else {
-      cue.end = Math.max(cue.end + d, cue.start + MIN_DUR);
+      ns = cue.start;
+      ne = Math.max(cue.end + d, cue.start + MIN_DUR);
     }
+    if (ns === cue.start && ne === cue.end) return;
+    // 整体平移时词元随之平移（在 requestBoundsChange 内按方案处理）；
+    // 起止调整则走“绝对 / 缩放”方案选择
+    var moved = mode === 'both';
+    if (!requestBoundsChange(state.selected, ns, ne,
+      { label: 'nudge', translate: moved })) return;
     fillRowTimes(state.selected);
     afterChange(null);
     setStatus('第 ' + cue.num + ' 条：' + C.fmtMs(cue.start, 'srt') + ' → ' + C.fmtMs(cue.end, 'srt'));
@@ -1458,6 +1509,10 @@
       if (e.key === 'Escape') hideCutBatch();
       return;
     }
+    if (!wordBoundsModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') { hideWordBounds(false); setStatus('已取消：区间与词元均未改变'); }
+      return;
+    }
     var step = e.shiftKey ? 500 : (e.altKey ? 10 : 100);
     switch (e.key) {
       case ' ':
@@ -1474,6 +1529,7 @@
       case "'": nudgeSelected('end', 1, step); break;
       case ',': snapSelected('start'); break;
       case '.': snapSelected('end'); break;
+      case 'm': case 'M': markNextAtPlayhead(); break;
       case '0': fitAll(); drawCanvas(); break;
       case 'ArrowUp':
         e.preventDefault();
@@ -1494,7 +1550,11 @@
     state.searchMatches = [];
     if (q && state.doc) {
       state.doc.cues.forEach(function (c, i) {
-        if (c.lines.join('\n').toLowerCase().indexOf(q) !== -1) state.searchMatches.push(i);
+        // 搜索覆盖逐词时间戳：合法的内联时间戳标签不参与匹配（其余标签按原文检索）
+        var hay = c.lines.map(function (l) {
+          return l.replace(/<(?:\d{1,3}:)?\d{1,2}:\d{2}[.,]\d{1,3}>/g, '');
+        }).join('\n').toLowerCase();
+        if (hay.indexOf(q) !== -1) state.searchMatches.push(i);
       });
     }
     state.searchIdx = -1;
@@ -1563,6 +1623,7 @@
     pushUndo('autofix');
     changes.forEach(function (ch) {
       var cue = state.doc.cues[ch.i];
+      adaptCueWordsForBatch(cue, ch.oldStart, ch.oldEnd, ch.newStart, ch.newEnd);
       cue.start = ch.newStart;
       cue.end = ch.newEnd;
     });
@@ -1685,6 +1746,13 @@
       .then(function (r) { return r.json(); })
       .then(function (data) { loadDocument(data.content, data.filename); })
       .catch(function () { setStatus('无法获取示例字幕（服务器未响应）'); });
+  });
+
+  btnSampleVtt.addEventListener('click', function () {
+    fetch('/api/sample?kind=vtt')
+      .then(function (r) { return r.json(); })
+      .then(function (data) { loadDocument(data.content, data.filename); })
+      .catch(function () { setStatus('无法获取 WebVTT 示例（服务器未响应）'); });
   });
 
   btnExport.addEventListener('click', function () {
@@ -2718,6 +2786,53 @@
     });
   }
 
+  // 取得有限的视频总时长（ms）。本地 WebM（如 MediaRecorder 录制）常上报
+  // Infinity：在取帧专用 video 上定位到极大时间，浏览器落到真实末尾后会
+  // 更新 duration；仍无法取得时 reject 并说明原因，避免无界扫描。
+  function resolveScanDuration() {
+    return new Promise(function (resolve, reject) {
+      if (isFinite(state.media.duration) && state.media.duration > 0) {
+        resolve(Math.round(state.media.duration));
+        return;
+      }
+      if (!scanVideo || scanReadyUrl !== state.media.url) {
+        reject(new Error('取帧器未就绪，无法确定视频时长'));
+        return;
+      }
+      var settled = false;
+      var timer = setTimeout(function () {
+        finish(new Error('视频缺少时长元数据，且定位末尾超时（8s），无法确定总时长；' +
+          '请换用封装完整的文件，或改用「选定区间」并填写明确的起止秒数'));
+      }, 8000);
+      function onUpdate() {
+        var d = scanVideo.duration;
+        if (isFinite(d) && d > 0) finish(null, Math.round(d * 1000));
+      }
+      function onSeeked() {
+        // 定位到末尾后 duration 可能稍后才更新：先检查一次，仍未知则等 durationchange
+        onUpdate();
+      }
+      function onErr() { finish(new Error('确定视频时长时解码出错')); }
+      function finish(err, ms) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        scanVideo.removeEventListener('seeked', onSeeked);
+        scanVideo.removeEventListener('durationchange', onUpdate);
+        scanVideo.removeEventListener('error', onErr);
+        if (err) reject(err); else resolve(ms);
+      }
+      scanVideo.addEventListener('seeked', onSeeked);
+      scanVideo.addEventListener('durationchange', onUpdate);
+      scanVideo.addEventListener('error', onErr);
+      try {
+        scanVideo.currentTime = Number.MAX_SAFE_INTEGER / 1000;   // 落到真实末尾
+      } catch (e) {
+        finish(new Error('无法定位视频末尾：' + (e && e.message ? e.message : e)));
+      }
+    });
+  }
+
   // 在 tMs 处取一帧并缩放到指定宽度，返回 ImageData；失败时说明原因
   function grabFrameAt(tMs, width) {
     return new Promise(function (resolve, reject) {
@@ -2777,13 +2892,13 @@
     if (!state.media.isVideo) { setStatus('当前媒体是音频，没有画面可供镜头检测'); return; }
     readSceneCfg();
     var cfg = state.scene.cfg;
-    var durMs = Math.round(state.media.duration);
-    var fromMs = 0, toMs = durMs;
-    if (cfg.range === 'part') {
-      fromMs = clamp(Math.round(cfg.from * 1000), 0, durMs);
-      toMs = cfg.to > 0 ? clamp(Math.round(cfg.to * 1000), 0, durMs) : durMs;
-      if (toMs - fromMs < cfg.interval * 2) {
-        setStatus('选定区间过短（' + C.fmtShort(fromMs) + ' ~ ' + C.fmtShort(toMs) +
+    // 时长已知时先校验区间；未知（部分 WebM 上报 Infinity）则待解析出真实时长后再校验
+    if (cfg.range === 'part' && isFinite(state.media.duration) && state.media.duration > 0) {
+      var d0 = Math.round(state.media.duration);
+      var f0 = clamp(Math.round(cfg.from * 1000), 0, d0);
+      var t0 = cfg.to > 0 ? clamp(Math.round(cfg.to * 1000), 0, d0) : d0;
+      if (t0 - f0 < cfg.interval * 2) {
+        setStatus('选定区间过短（' + C.fmtShort(f0) + ' ~ ' + C.fmtShort(t0) +
           '），需至少覆盖 2 个采样间隔');
         return;
       }
@@ -2796,6 +2911,26 @@
     try {
       setSceneProgress(0.02, '正在准备视频解码…');
       await ensureScanVideo();
+      // 整段分析必须先取得有限时长，避免 Infinity 导致无界扫描
+      var durMs;
+      if (isFinite(state.media.duration) && state.media.duration > 0) {
+        durMs = Math.round(state.media.duration);
+      } else {
+        setSceneProgress(0.04, '视频缺少时长元数据，正在定位末尾确定时长…');
+        durMs = await resolveScanDuration();
+        state.media.duration = durMs;   // 媒体时钟同步显示真实总时长
+        updatePlayUI();
+        if (!(+sceneTo.value > 0)) sceneTo.value = (durMs / 1000).toFixed(1);
+      }
+      var fromMs = 0, toMs = durMs;
+      if (cfg.range === 'part') {
+        fromMs = clamp(Math.round(cfg.from * 1000), 0, durMs);
+        toMs = cfg.to > 0 ? clamp(Math.round(cfg.to * 1000), 0, durMs) : durMs;
+        if (toMs - fromMs < cfg.interval * 2) {
+          throw new Error('选定区间过短（' + C.fmtShort(fromMs) + ' ~ ' + C.fmtShort(toMs) +
+            '），需至少覆盖 2 个采样间隔');
+        }
+      }
       var threshold = sensToThreshold(cfg.sens);
       // —— 第一遍：按采样间隔粗扫，比较相邻帧亮度与色彩直方图 ——
       var samples = [];
@@ -2822,9 +2957,16 @@
         var lo = samples[c.i - 1].t, hi = c.t;
         var step = Math.max(33, Math.round((hi - lo) / 8));
         var fine = [];
-        for (var ft = lo; ft <= hi + 1; ft += step) {
+        for (var ft = lo; ft < hi; ft += step) {
           var fimg = await grabFrameAt(Math.min(ft, durMs - 1), 160);
           fine.push({ t: Math.round(ft), metrics: C.frameMetrics(fimg.data, 8) });
+        }
+        // 必须覆盖候选边界后的那一帧（切点位于 (lo, hi] 内）：
+        // 若步进取整漏掉 hi，细样本会全是切前帧，相邻差异全零，
+        // 零差异样本会被误当作切点，位置与强度都不对
+        if (!fine.length || fine[fine.length - 1].t < hi) {
+          var himg = await grabFrameAt(Math.min(hi, durMs - 1), 160);
+          fine.push({ t: Math.round(hi), metrics: C.frameMetrics(himg.data, 8) });
         }
         var r = C.refineCutWindow(fine);
         if (r) cuts.push({ time: Math.round(r.t), strength: r.score });
@@ -2905,6 +3047,8 @@
   btnCutClose.addEventListener('click', hideCutDetail);
   cutModal.addEventListener('click', function (e) { if (e.target === cutModal) hideCutDetail(); });
 
+  // 逐条吸附校验：负时间、无效时长，以及规则不允许的相邻重叠
+  // （与批量计划 planCutSnap 的排除规则一致；返回原因文案，null 表示可吸附）
   function cutSnapError(cueIdx, cutIdx, field) {
     var cue = state.doc.cues[cueIdx];
     var cut = state.scene.cuts[cutIdx];
@@ -2914,9 +3058,23 @@
       if (cue.end - cut.time < MIN_DUR) {
         return '吸附后时长不足 ' + MIN_DUR + 'ms（终点 ' + C.fmtMs(cue.end, 'srt') + '）';
       }
+      if (!state.settings.allowOverlap && cueIdx > 0) {
+        var prevEnd = state.doc.cues[cueIdx - 1].end;
+        if (cut.time < prevEnd) {
+          return '吸附后起点早于上一条终点 ' + C.fmtMs(prevEnd, 'srt') +
+            '，规则不允许重叠（可在设置中开启「允许重叠」）';
+        }
+      }
     } else {
       if (cut.time - cue.start < MIN_DUR) {
         return '吸附后时长不足 ' + MIN_DUR + 'ms（起点 ' + C.fmtMs(cue.start, 'srt') + '）';
+      }
+      if (!state.settings.allowOverlap && cueIdx + 1 < state.doc.cues.length) {
+        var nextStart = state.doc.cues[cueIdx + 1].start;
+        if (cut.time > nextStart) {
+          return '吸附后终点晚于下一条起点 ' + C.fmtMs(nextStart, 'srt') +
+            '，规则不允许重叠（可在设置中开启「允许重叠」）';
+        }
       }
     }
     return null;
@@ -2987,8 +3145,10 @@
     var err = cutSnapError(d.cue, d.cutIdx, field);
     if (err) { setStatus('无法吸附：' + err); return; }
     pushUndo('cutsnap');
+    var oldS = cue.start, oldE = cue.end;
     if (field === 'start') cue.start = cut.time;
     else cue.end = cut.time;
+    adaptCueWordsForBatch(cue, oldS, oldE, cue.start, cue.end);
     fillRowTimes(d.cue);
     afterChange('已将第 ' + cue.num + ' 条' + (field === 'start' ? '起点' : '终点') +
       ' 吸附到切点 ' + C.fmtMs(cut.time, 'srt'));
@@ -3071,6 +3231,7 @@
     pushUndo('cutsnapbatch');
     plan.changes.forEach(function (ch) {
       var cue = state.doc.cues[ch.i];
+      adaptCueWordsForBatch(cue, ch.oldStart, ch.oldEnd, ch.newStart, ch.newEnd);
       cue.start = ch.newStart;
       cue.end = ch.newEnd;
     });
@@ -3079,6 +3240,614 @@
     afterChange('已批量吸附 ' + plan.changes.length + ' 条到切点' +
       (plan.skipped.length ? '（排除 ' + plan.skipped.length + ' 条不合规项）' : ''));
   });
+
+  // ============================================================
+  // WebVTT 逐词时间码（词元轨道）
+  // 选中字幕时在时间轴与列表之间展开词元轨道：
+  //   · 播放媒体（或模拟播放头）时按 M 依次把当前时间标记为下一词元起点
+  //   · 拖动词元轨道上的标记竖线，或点击词元输入时间
+  //   · 标记必须严格递增且位于 cue 区间内；标签 / 实体 / 英文单词 / 数字串不拆
+  //   · 改 cue 起止时比较“保持绝对时间 / 按比例缩放”，越界方案禁用
+  // ============================================================
+
+  var wordCssW = 0, wordCssH = 34;
+
+  function selectedCue() {
+    return (state.doc && state.selected >= 0) ? state.doc.cues[state.selected] : null;
+  }
+  // 测试 / 调试钩子
+  window.__dbgSelectedSpan = function () {
+    var c = selectedCue();
+    return c ? { start: c.start, end: c.end } : null;
+  };
+  window.__dbgPlayhead = function () { return state.playheadMs; };
+  function cueHasWordMarks(cue) {
+    if (!cue) return false;
+    return C.parseCueWords(cue).marks.length > 0;
+  }
+
+  // 词元轨道是否对当前选中条可见（有正文即展示，便于手工标记）
+  function wordPanelVisible() {
+    return !!selectedCue();
+  }
+
+  function currentWordData() {
+    var cue = selectedCue();
+    if (!cue) return null;
+    return C.parseCueWords(cue);
+  }
+
+  // ---------- 渲染 ----------
+  function renderWordPanel() {
+    var cue = selectedCue();
+    var show = !!cue;
+    wordPanel.classList.toggle('hidden', !show);
+    if (!cue) return;
+    var w = C.parseCueWords(cue);
+    wordPanelCue.textContent = '#' + cue.num;
+    wordPanelRange.textContent = C.fmtMs(cue.start, 'srt') + ' → ' + C.fmtMs(cue.end, 'srt');
+    var nErr = w.errors.length;
+    wordPanelCount.textContent = w.marks.length + ' 个标记' +
+      (nErr ? ' · ' + nErr + ' 处错误' : '');
+    wordPanelCount.classList.toggle('has-err', nErr > 0);
+    renderWordChips(cue, w);
+    resizeWordRuler();
+    drawWordRuler();
+  }
+
+  // 词元 chips：每个不可拆正文单元一块；已标记显示起点时间
+  function renderWordChips(cue, w) {
+    wordChips.innerHTML = '';
+    var errOffs = {};
+    w.errors.forEach(function (e) { errOffs[e.off] = e; });
+    var markByTok = {};
+    w.marks.forEach(function (m) { markByTok[m.tok] = m; });
+    var activeTok = state.playheadMs !== undefined ? C.activeWord(cue, state.playheadMs) : -1;
+    var frag = document.createDocumentFragment();
+    var prevContentLine = -1;
+    w.toks.forEach(function (t, i) {
+      if (t.type === 'ts') return;
+      if (t.type === 'space') {
+        if (t.s.indexOf('\n') !== -1) frag.appendChild(document.createElement('br'));
+        else {
+          var sp = document.createElement('span');
+          sp.className = 'wc-space';
+          sp.textContent = t.s;
+          frag.appendChild(sp);
+        }
+        return;
+      }
+      if (t.type === 'tag') {
+        var tag = document.createElement('span');
+        tag.className = 'wc-tag';
+        tag.textContent = t.s;
+        tag.title = '标签（不可标记，导出时保留）';
+        frag.appendChild(tag);
+        return;
+      }
+      // 正文单元
+      var chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'wc-chip' +
+        (markByTok[i] ? ' marked' : '') +
+        (i === activeTok ? ' active' : '');
+      chip.dataset.tok = i;
+      var label = t.type === 'entity' ? C.decodeEntity(t.s) : t.s;
+      chip.textContent = label;
+      var mk = markByTok[i];
+      if (mk) {
+        var tm = document.createElement('span');
+        tm.className = 'wc-time mono';
+        tm.textContent = C.fmtShort(mk.time);
+        chip.appendChild(tm);
+      }
+      var err = errOffs[t.off];
+      if (err) {
+        chip.classList.add('wc-err');
+        chip.title = err.msg;
+      } else if (mk) {
+        chip.title = '词元起点 ' + C.fmtMs(mk.time, 'srt') + '（点击输入时间，可清除）';
+      } else {
+        chip.title = '点击输入起点时间；播放时按 M 顺序标记';
+      }
+      frag.appendChild(chip);
+    });
+    wordChips.appendChild(frag);
+  }
+
+  // ---------- 词元轨道画布（cue 区间内的标记竖线 + 播放头） ----------
+  function wordX(t) {
+    var cue = selectedCue();
+    if (!cue) return 0;
+    var dur = Math.max(1, cue.end - cue.start);
+    return (t - cue.start) / dur * wordCssW;
+  }
+  function wordTimeFromX(x) {
+    var cue = selectedCue();
+    var dur = Math.max(1, cue.end - cue.start);
+    return cue.start + clamp(x, 0, wordCssW) / wordCssW * dur;
+  }
+  function resizeWordRuler() {
+    var dpr = window.devicePixelRatio || 1;
+    wordCssW = wordRulerWrap.clientWidth || 800;
+    wordCssH = 34;
+    wordRuler.style.width = wordCssW + 'px';
+    wordRuler.width = Math.round(wordCssW * dpr);
+    wordRuler.height = Math.round(wordCssH * dpr);
+    wordRuler.style.height = wordCssH + 'px';
+    wordRulerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  function drawWordRuler() {
+    var cue = selectedCue();
+    if (!cue || !wordCssW) return;
+    var ctx2 = wordRulerCtx;
+    ctx2.clearRect(0, 0, wordCssW, wordCssH);
+    // 区间轨道
+    ctx2.fillStyle = '#111a2b';
+    ctx2.fillRect(0, 10, wordCssW, wordCssH - 14);
+    ctx2.strokeStyle = '#2b3652';
+    ctx2.strokeRect(0.5, 10.5, wordCssW - 1, wordCssH - 15);
+    var w = C.parseCueWords(cue);
+    var badOff = {};
+    w.errors.forEach(function (e) {
+      if (e.kind === 'order' || e.kind === 'outrange') badOff[e.time] = e.kind;
+    });
+    // 标记竖线
+    w.marks.forEach(function (m) {
+      var x = wordX(m.time);
+      var bad = m.time < cue.start || m.time > cue.end;
+      ctx2.strokeStyle = bad ? '#f87171' : '#5eead4';
+      ctx2.lineWidth = 1.5;
+      ctx2.beginPath();
+      ctx2.moveTo(x, 8); ctx2.lineTo(x, wordCssH - 3);
+      ctx2.stroke();
+      ctx2.fillStyle = bad ? '#f87171' : '#5eead4';
+      ctx2.beginPath();
+      ctx2.moveTo(x - 4, 10); ctx2.lineTo(x + 4, 10); ctx2.lineTo(x, 5);
+      ctx2.closePath(); ctx2.fill();
+    });
+    // 播放头（仅在 cue 区间内）
+    if (state.playheadMs >= cue.start && state.playheadMs <= cue.end) {
+      var px = wordX(state.playheadMs);
+      ctx2.strokeStyle = '#f87171';
+      ctx2.lineWidth = 1.5;
+      ctx2.beginPath();
+      ctx2.moveTo(px, 2); ctx2.lineTo(px, wordCssH - 2);
+      ctx2.stroke();
+    }
+    ctx2.fillStyle = '#8595b6';
+    ctx2.font = '10px ' + getComputedStyle(document.body).fontFamily;
+    ctx2.textBaseline = 'top';
+    ctx2.fillText(C.fmtShort(cue.start), 2, 18);
+    ctx2.fillText(C.fmtShort(cue.end), wordCssW - 42, 18);
+  }
+
+  // 拖拽 / 播放头移动时仅轻量刷新（不重建 chips，避免输入中失焦）
+  function refreshWordPanelLive() {
+    if (wordPanel.classList.contains('hidden')) return;
+    updateWordChipsActive();
+    drawWordRuler();
+  }
+  function updateWordChipsActive() {
+    var cue = selectedCue();
+    if (!cue) return;
+    var active = C.activeWord(cue, state.playheadMs);
+    var chips = wordChips.querySelectorAll('.wc-chip');
+    chips.forEach(function (el) {
+      el.classList.toggle('active', +el.dataset.tok === active);
+    });
+  }
+
+  // ---------- 标记 / 修改 / 清除 ----------
+  function applyWordLines(cue, lines, label) {
+    pushUndo(label || 'word');
+    cue.lines = lines;
+    renderList();
+    selectCue(state.selected, { scroll: false });
+    afterChange(null);
+  }
+
+  function setMark(cue, tok, time, label) {
+    var res = C.setWordTime(cue, tok, Math.round(time));
+    if (res.error) { setStatus('无法标记：' + res.error); return false; }
+    applyWordLines(cue, res.lines, label || 'wordmark');
+    return true;
+  }
+
+  // M 键：把播放头标记为“下一个未标记词元”的起点（按正文顺序）
+  function markNextAtPlayhead() {
+    var cue = selectedCue();
+    if (!cue || !wordArmChk.checked) return;
+    var w = C.parseCueWords(cue);
+    var marked = {};
+    w.marks.forEach(function (m) { marked[m.tok] = true; });
+    var next = -1;
+    for (var i = 0; i < w.toks.length; i++) {
+      if (C.isContentTok(w.toks[i]) && !marked[i]) { next = i; break; }
+    }
+    if (next < 0) { setStatus('该条词元已全部标记，可改用预览对比或导出 VTT'); return; }
+    if (state.playheadMs < cue.start || state.playheadMs > cue.end) {
+      setStatus('播放头 ' + C.fmtShort(state.playheadMs) + ' 不在第 ' + cue.num +
+        ' 条区间内，词元起点必须位于字幕区间内（未标记）');
+      return;
+    }
+    if (setMark(cue, next, state.playheadMs, 'wordmark')) {
+      var label = w.toks[next].type === 'entity' ? C.decodeEntity(w.toks[next].s) : w.toks[next].s;
+      setStatus('已把「' + label + '」起点标记为 ' + C.fmtMs(Math.round(state.playheadMs), 'srt') +
+        '（' + (w.marks.length + 1) + ' 个词元）');
+    }
+  }
+
+  // chips 点击：已标记 → 弹出内联时间输入；未标记 → 直接用当前播放头
+  wordChips.addEventListener('click', function (e) {
+    var chip = e.target.closest('.wc-chip');
+    if (!chip) return;
+    var cue = selectedCue();
+    if (!cue) return;
+    var tok = +chip.dataset.tok;
+    var w = C.parseCueWords(cue);
+    var mk = w.marks.find(function (m) { return m.tok === tok; });
+    if (!mk) {
+      if (state.playheadMs >= cue.start && state.playheadMs <= cue.end) {
+        setMark(cue, tok, state.playheadMs, 'wordmark');
+      } else {
+        openWordTimeEditor(chip, cue, tok, null);
+      }
+      return;
+    }
+    openWordTimeEditor(chip, cue, tok, mk);
+  });
+
+  // 内联时间输入（含清除按钮）
+  function openWordTimeEditor(chip, cue, tok, mk) {
+    var existing = wordChips.querySelector('.wc-edit');
+    if (existing) existing.remove();
+    state.word.editTok = tok;
+    var box = document.createElement('span');
+    box.className = 'wc-edit';
+    box.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    var input = document.createElement('input');
+    input.className = 'mono';
+    input.spellcheck = false;
+    input.value = mk ? C.fmtMs(mk.time, 'srt') : C.fmtMs(clamp(state.playheadMs, cue.start, cue.end), 'srt');
+    var ok = document.createElement('button');
+    ok.type = 'button'; ok.className = 'mini primary'; ok.textContent = '确定';
+    var clr = document.createElement('button');
+    clr.type = 'button'; clr.className = 'mini'; clr.textContent = '清除';
+    var cancel = document.createElement('button');
+    cancel.type = 'button'; cancel.className = 'mini'; cancel.textContent = '×';
+    box.appendChild(input); box.appendChild(ok); box.appendChild(clr); box.appendChild(cancel);
+    chip.insertAdjacentElement('afterend', box);
+    input.focus(); input.select();
+    function finish() { box.remove(); state.word.editTok = -1; }
+    function save() {
+      var ms = C.parseTimecode(input.value);
+      if (ms === null) { input.classList.add('invalid'); setStatus('无法识别时间格式：' + input.value); return; }
+      if (setMark(cue, tok, ms, 'wordedit')) finish();
+    }
+    ok.addEventListener('click', save);
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); save(); }
+      else if (ev.key === 'Escape') finish();
+      ev.stopPropagation();
+    });
+    clr.addEventListener('click', function () {
+      var res = C.clearWordTime(cue, tok);
+      if (res.error) { setStatus(res.error); return; }
+      applyWordLines(cue, res.lines, 'wordclear');
+      finish();
+    });
+    cancel.addEventListener('click', finish);
+  }
+
+  btnWordClear.addEventListener('click', function () {
+    var cue = selectedCue();
+    if (!cue || !cueHasWordMarks(cue)) return;
+    var res = C.clearAllWordTimes(cue);
+    applyWordLines(cue, res.lines, 'wordclearall');
+    setStatus('已清空第 ' + cue.num + ' 条的全部词元标记（正文与标签保留）');
+  });
+
+  // ---------- 词元轨道拖拽标记 ----------
+  var wordDrag = null;
+  wordRuler.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;
+    var cue = selectedCue();
+    if (!cue) return;
+    var rect = wordRuler.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var w = C.parseCueWords(cue);
+    var hit = null;
+    w.marks.forEach(function (m) {
+      if (Math.abs(wordX(m.time) - x) <= 6) hit = m;
+    });
+    if (hit) {
+      wordDrag = { tok: hit.tok, orig: hit.time, moved: false, undo: false };
+    } else {
+      // 点空白：把播放头 / 媒体定位到 cue 区间内该时刻
+      var t = Math.round(wordTimeFromX(x));
+      setPlayhead(t);
+    }
+  });
+  window.addEventListener('mousemove', function (e) {
+    if (!wordDrag || wordPanel.classList.contains('hidden')) return;
+    var cue = selectedCue();
+    if (!cue) { wordDrag = null; return; }
+    var rect = wordRuler.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var t = Math.round(wordTimeFromX(x));
+    if (t === wordDrag.orig && !wordDrag.moved) return;
+    wordDrag.moved = true;
+    // 相邻标记约束（预览态，不写模型）
+    var probe2 = C.parseCueWords(cue);
+    var dragMk = probe2.marks.find(function (m) { return m.tok === wordDrag.tok; });
+    if (dragMk) dragMk.time = clamp(t, cue.start, cue.end);
+    var prevT = -Infinity, nextT = Infinity;
+    probe2.marks.forEach(function (m) {
+      if (m.tok === wordDrag.tok) return;
+      if (m.time <= wordDrag.orig && m.time > prevT) prevT = m.time;
+      if (m.time >= wordDrag.orig && m.time < nextT) nextT = m.time;
+    });
+    var bad = t <= prevT || t >= nextT || t < cue.start || t > cue.end;
+    wordRuler.classList.toggle('drag-bad', bad);
+    drawWordRulerStatic(cue, probe2, t);
+  });
+  // 用给定 marks 数据重绘（拖拽预览）
+  function drawWordRulerStatic(cue, w, dragT) {
+    var ctx2 = wordRulerCtx;
+    ctx2.clearRect(0, 0, wordCssW, wordCssH);
+    ctx2.fillStyle = '#111a2b';
+    ctx2.fillRect(0, 10, wordCssW, wordCssH - 14);
+    ctx2.strokeStyle = '#2b3652';
+    ctx2.strokeRect(0.5, 10.5, wordCssW - 1, wordCssH - 15);
+    w.marks.forEach(function (m) {
+      var x = wordX(m.time);
+      ctx2.strokeStyle = '#5eead4';
+      ctx2.lineWidth = 1.5;
+      ctx2.beginPath(); ctx2.moveTo(x, 8); ctx2.lineTo(x, wordCssH - 3); ctx2.stroke();
+      ctx2.fillStyle = '#5eead4';
+      ctx2.beginPath();
+      ctx2.moveTo(x - 4, 10); ctx2.lineTo(x + 4, 10); ctx2.lineTo(x, 5);
+      ctx2.closePath(); ctx2.fill();
+    });
+    var dx = wordX(clamp(dragT, cue.start, cue.end));
+    ctx2.strokeStyle = '#fbbf24';
+    ctx2.lineWidth = 2;
+    ctx2.beginPath(); ctx2.moveTo(dx, 2); ctx2.lineTo(dx, wordCssH - 2); ctx2.stroke();
+  }
+  window.addEventListener('mouseup', function (e) {
+    if (!wordDrag) return;
+    var d = wordDrag;
+    wordDrag = null;
+    wordRuler.classList.remove('drag-bad');
+    if (!d.moved) return;
+    var cue = selectedCue();
+    if (!cue) return;
+    var rect = wordRuler.getBoundingClientRect();
+    var t = Math.round(wordTimeFromX(e.clientX - rect.left));
+    setMark(cue, d.tok, t, 'worddrag');
+  });
+
+  // 批量改时（自动顺延 / 双锚点 / 切点吸附等）时处理词元标记：
+  // 优先保持绝对时间；若标记会越界且缩放合法则按新区间缩放；都不行则保留绝对时间
+  // （随后由词元检查面板报越界，绝不静默删除标记）。
+  function adaptCueWordsForBatch(cue, oldStart, oldEnd, newStart, newEnd) {
+    if (!cueHasWordMarks(cue)) return;
+    if (oldStart === newStart && oldEnd === newEnd) return;
+    var probe = C.parseCueWords(cue);
+    var baseCue = { start: oldStart, end: oldEnd, lines: cue.lines };
+    var plan = C.planWordBounds(baseCue, newStart, newEnd);
+    if (plan.absolute.ok) return;
+    if (plan.scale.ok) {
+      var sc = C.scaleWordTimes(baseCue, newStart, newEnd);
+      if (!sc.error) cue.lines = sc.lines;
+    }
+  }
+
+  // ---------- 改 cue 起止：两方案比较 ----------
+  // 请求把第 i 条区间改为 [ns, ne]。
+  //   · 无词元标记：直接应用（pushUndo 一次），返回 true
+  //   · 有词元标记：弹窗比较“保持绝对时间 / 按比例缩放”；越界方案禁用。
+  //     opts.alreadyMutated（拖拽）：模型已临时改成新区间，取消时回退 orig；
+  //     opts.translate（键盘整体平移）：等价于绝对时间平移，仅在可行时直接应用。
+  // 返回 true 表示已应用；false 表示弹窗待决或被拒绝（调用方不得继续 afterChange）。
+  function requestBoundsChange(i, ns, ne, opts) {
+    opts = opts || {};
+    if (!state.doc) return false;
+    var cue = state.doc.cues[i];
+    if (ns === cue.start && ne === cue.end && !opts.alreadyMutated) return true;
+    if (!cueHasWordMarks(cue)) {
+      pushUndo(opts.label || 'edit');
+      cue.start = ns; cue.end = ne;
+      renderList();
+      selectCue(i, { scroll: false });
+      afterChange(null);
+      return true;
+    }
+    // 记录“原始 cue 快照”（弹窗取消时 alreadyMutated 需要恢复）
+    var origCue = JSON.parse(JSON.stringify(cue));
+    var baseCue = opts.alreadyMutated && opts.orig
+      ? { start: opts.orig.start, end: opts.orig.end, lines: cue.lines }
+      : { start: cue.start, end: cue.end, lines: cue.lines };
+    var plan = C.planWordBounds(baseCue, ns, ne);
+    // 键盘整体平移：绝对时间随区间平移后仍合法则直接平移，不打断操作
+    if (opts.translate) {
+      var delta = ns - baseCue.start;
+      var tr = C.translateWordTimes(baseCue, delta, { start: ns, end: ne });
+      if (!tr.error) {
+        pushUndo(opts.label || 'nudge');
+        cue.start = ns; cue.end = ne; cue.lines = tr.lines;
+        renderList();
+        selectCue(i, { scroll: false });
+        afterChange(null);
+        return true;
+      }
+      // 平移会让标记越界 → 落到弹窗比较（缩放仍可能可用）
+    }
+    openWordBoundsModal(i, baseCue, ns, ne, plan, opts, origCue);
+    return false;
+  }
+
+  function openWordBoundsModal(i, baseCue, ns, ne, plan, opts, origCue) {
+    var cue = state.doc.cues[i];
+    state.word.pendingBounds = {
+      i: i, ns: ns, ne: ne, baseCue: baseCue, plan: plan, opts: opts, origCue: origCue,
+    };
+    wordBoundsCue.textContent = '第 ' + cue.num + ' 条：' +
+      C.fmtMs(baseCue.start, 'srt') + ' → ' + C.fmtMs(baseCue.end, 'srt') +
+      ' 改为 ' + C.fmtMs(ns, 'srt') + ' → ' + C.fmtMs(ne, 'srt') +
+      ' · ' + plan.nMarks + ' 个词元标记';
+    // 绝对时间
+    wbAbsState.innerHTML = plan.absolute.ok
+      ? '<span class="ok">✓ 全部标记仍在新区间内</span>'
+      : '<span class="bad">✗ ' + esc(plan.absolute.reason) + '</span>';
+    btnWbAbs.disabled = !plan.absolute.ok;
+    // 缩放
+    wbScaleDesc.textContent = '词元随新区间线性映射（' +
+      C.fmtMs(baseCue.start, 'srt') + '→' + C.fmtMs(ns, 'srt') + ' …）。';
+    wbScaleState.innerHTML = plan.scale.ok
+      ? '<span class="ok">✓ 映射后仍严格递增且不越界</span>'
+      : '<span class="bad">✗ ' + esc(plan.scale.reason) + '</span>';
+    btnWbScale.disabled = !plan.scale.ok;
+    renderWordBoundsDiff(baseCue, ns, ne, plan);
+    wordBoundsModal.classList.remove('hidden');
+  }
+
+  function renderWordBoundsDiff(baseCue, ns, ne, plan) {
+    var w = C.parseCueWords(baseCue);
+    wordBoundsDiffBody.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    w.marks.forEach(function (m, k) {
+      var text = '';
+      for (var j = m.tok; j < w.toks.length; j++) {
+        if (C.isContentTok(w.toks[j])) { text += w.toks[j].type === 'entity' ? C.decodeEntity(w.toks[j].s) : w.toks[j].s; }
+        var stop = false;
+        for (var q = j + 1; q < w.toks.length; q++) {
+          if (w.toks[q].type === 'ts') { stop = true; break; }
+          if (C.isContentTok(w.toks[q])) { stop = true; break; }
+        }
+        if (stop) break;
+      }
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + esc(text.slice(0, 8)) + '</td>' +
+        '<td class="mono old">' + C.fmtMs(m.time, 'srt') + '</td>' +
+        '<td><span class="mono abs">' + C.fmtMs(plan.absolute.marks[k], 'srt') + '</span>' +
+        ' / <span class="mono scl">' + C.fmtMs(plan.scale.marks[k] !== undefined ? plan.scale.marks[k] : m.time, 'srt') + '</span></td>';
+      frag.appendChild(tr);
+    });
+    wordBoundsDiffBody.appendChild(frag);
+  }
+
+  function hideWordBounds(apply) {
+    var pb = state.word.pendingBounds;
+    if (pb && !apply && pb.opts && pb.opts.alreadyMutated) {
+      // 拖拽产生的临时改动被取消：恢复拖拽前 cue，并撤回拖拽开始时压入的空快照
+      var cue = state.doc.cues[pb.i];
+      cue.start = pb.origCue.start;
+      cue.end = pb.origCue.end;
+      cue.lines = pb.origCue.lines;
+      if (state.undoStack.length) {
+        state.undoStack.pop();
+        updateUndoButtons();
+      }
+      renderList();
+      selectCue(pb.i, { scroll: false });
+      afterChange(null);
+    } else if (pb && !apply && pb.i !== undefined) {
+      // 时间框输入 / 吸附等来源：模型从未改变，仅还原输入框显示
+      fillRowTimes(pb.i);
+    }
+    state.word.pendingBounds = null;
+    wordBoundsModal.classList.add('hidden');
+  }
+  btnWbCancel.addEventListener('click', function () {
+    hideWordBounds(false);
+    setStatus('已取消：区间与词元均未改变');
+  });
+  wordBoundsModal.addEventListener('click', function (e) {
+    if (e.target === wordBoundsModal) {
+      hideWordBounds(false);
+      setStatus('已取消：区间与词元均未改变');
+    }
+  });
+
+  function applyWordBounds(mode) {
+    var pb = state.word.pendingBounds;
+    if (!pb) return;
+    var cue = state.doc.cues[pb.i];
+    var res;
+    if (mode === 'absolute') {
+      if (!pb.plan.absolute.ok) { setStatus('保持绝对时间会越界，该方案不可应用'); return; }
+      // 区间改变、词元文本不动
+      res = { lines: cue.lines };
+    } else {
+      res = C.scaleWordTimes(pb.baseCue, pb.ns, pb.ne);
+      if (res.error) { setStatus('按比例缩放不可应用：' + res.error); return; }
+    }
+    // alreadyMutated（拖拽）时撤销快照已在拖拽开始压入；此处不重复压栈
+    if (!pb.opts.alreadyMutated) pushUndo(pb.opts.label || 'edit');
+    cue.start = pb.ns; cue.end = pb.ne;
+    cue.lines = res.lines;
+    state.word.pendingBounds = null;
+    wordBoundsModal.classList.add('hidden');
+    renderList();
+    selectCue(pb.i, { scroll: false });
+    afterChange(mode === 'absolute' ? '已保持词元绝对时间，仅调整区间' : '已按比例缩放词元时间并调整区间');
+  }
+  btnWbAbs.addEventListener('click', function () { applyWordBounds('absolute'); });
+  btnWbScale.addEventListener('click', function () { applyWordBounds('scale'); });
+
+  // ---------- 错误定位 ----------
+  function locateWordError(p) {
+    var cue = state.doc.cues[p.cue];
+    setStatus('第 ' + cue.num + ' 条 ' + p.msg);
+    // 在文本框中定位到行列位置
+    var ta = rowEls[p.cue] && rowEls[p.cue].querySelector('textarea');
+    if (ta && p.line !== undefined) {
+      var lines = ta.value.split('\n');
+      var pos = 0;
+      for (var k = 0; k < p.line - 1 && k < lines.length; k++) pos += lines[k].length + 1;
+      pos += Math.max(0, p.col - 1);
+      ta.focus();
+      ta.setSelectionRange(pos, Math.min(ta.value.length, pos + (p.len || 1)));
+    }
+    renderWordPanel();
+    // 高亮出错 chip
+    setTimeout(function () {
+      var bad = wordChips.querySelector('.wc-err');
+      if (bad) {
+        bad.classList.add('flash');
+        bad.scrollIntoView({ block: 'nearest', inline: 'center' });
+      }
+    }, 0);
+  }
+
+  // ---------- 预览区随播放头高亮当前词元 ----------
+  // nowCueText / 视频叠加层改用 cuePreviewHtml（保留 v/c/ruby 标签，逐词高亮）
+  var lastNowSig = '';
+  function updateWordPreview() {
+    if (!state.doc) { lastNowSig = ''; return; }
+    var list = state.doc.cues;
+    var idx = -1;
+    for (var i = 0; i < list.length; i++) {
+      if (state.playheadMs >= list[i].start && state.playheadMs < list[i].end) { idx = i; break; }
+    }
+    var sig = idx < 0 ? ('empty:' + Math.round(state.playheadMs / 100)) :
+      idx + ':' + list[idx].start + ':' + list[idx].end + ':' + Math.round(state.playheadMs / 50);
+    if (sig === lastNowSig) return;
+    lastNowSig = sig;
+    if (idx < 0) {
+      nowCueText.textContent = '（播放头处无字幕）';
+      nowCueText.classList.add('on');
+      nowCueOverlay.innerHTML = '';
+      return;
+    }
+    var pv = C.cuePreviewHtml(list[idx], state.playheadMs);
+    nowCueText.classList.add('on');
+    nowCueText.innerHTML = pv.html || esc(list[idx].lines.join(' '));
+    nowCueOverlay.innerHTML = pv.html || esc(list[idx].lines.join(' '));
+  }
 
   // ---------- 初始化 ----------
   function init() {
@@ -3094,6 +3863,8 @@
     resizeCanvas();
     if (window.ResizeObserver) {
       new ResizeObserver(resizeCanvas).observe(timelineWrap);
+      new ResizeObserver(function () { if (!wordPanel.classList.contains('hidden')) { resizeWordRuler(); drawWordRuler(); } })
+        .observe(wordRulerWrap);
       new ResizeObserver(function () { if (state.compareOn) resizeCompareCanvas(); }).observe(compareView);
     } else {
       window.addEventListener('resize', resizeCanvas);

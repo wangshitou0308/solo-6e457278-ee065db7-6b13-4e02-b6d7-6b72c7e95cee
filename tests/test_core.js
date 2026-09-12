@@ -689,7 +689,7 @@ function seqOf(pattern) {   // pattern: 'R'/'B'/'D' 序列 → 采样序列
   eq(Core.findCutCandidates(seqOf('RRRRRBBBBB'), 0.99, 500).length, 0, '阈值过高无候选');
   eq(Core.findCutCandidates(seqOf('RRRRRRRRRR'), 0.2, 500).length, 0, '无变化无候选');
   // 相邻 250ms 内的两个超阈值边界 → NMS 只留最强
-  const two = Core.findCutCandidates(seqOf('RRBDB'), 0.05, 500);
+  const two = Core.findCutCandidates(seqOf('RRBDB'), 0.05, 600);
   eq(two.length, 1, '近距候选被非极大值抑制合并');
   // 相距足够远的两次切换都保留
   const far = Core.findCutCandidates(seqOf('RRRRBBBBDDDD'), 0.2, 500);
@@ -704,6 +704,13 @@ function seqOf(pattern) {   // pattern: 'R'/'B'/'D' 序列 → 采样序列
   ok(r.score > 0.4, '细化返回变化强度');
   eq(Core.refineCutWindow([{ t: 0, metrics: mRed }]), null, '样本不足返回 null');
   eq(Core.refineCutWindow([]), null, '空样本返回 null');
+  // 细采样全是切前帧（未覆盖变化后的帧）→ 相邻差异全零 → 不得当作切点
+  eq(Core.refineCutWindow(seqOf('RRRRRR')), null, '零差异样本不当作切点');
+  // 变化后的帧只在末尾一帧 → 切点定位到该帧，强度为真实差异
+  const covered = seqOf('RRRRRR').concat([{ t: 1250, metrics: mBlue }]);
+  const rc = Core.refineCutWindow(covered);
+  eq(rc.t, 1250, '覆盖到变化后帧时定位到实际边界');
+  ok(rc.score > 0.4, '强度为真实差异：' + rc.score.toFixed(3));
 }
 
 // ---- 最近切点 ----
@@ -720,9 +727,9 @@ const cutList = [{ time: 1600, strength: 0.8 }, { time: 3200, strength: 0.9 }];
 {
   const cuesX = [
     { num: '1', start: 500, end: 2400, lines: ['横跨切点'] },     // 1600 在内部 → cross
-    { num: '2', start: 2850, end: 3000, lines: ['终点近切点'] },   // end 距 3200 为 200 → near-end
+    { num: '2', start: 2700, end: 3000, lines: ['终点近切点'] },   // end 距 3200 为 200 → near-end
     { num: '3', start: 3400, end: 5000, lines: ['起点近切点'] },   // start 距 3200 为 200 → near-start
-    { num: '4', start: 1600, end: 2000, lines: ['起点贴合'] },     // 恰好贴合 → 不报
+    { num: '4', start: 1600, end: 2400, lines: ['起点贴合'] },     // 起点恰好贴合、终点距两切点均 > 容差 → 不报
   ];
   const probs = Core.analyzeCutConflicts(cuesX, cutList, 400);
   eq(probs.length, 3, '检出 3 个切点问题（贴合的不报）');
@@ -740,8 +747,8 @@ const cutList = [{ time: 1600, strength: 0.8 }, { time: 3200, strength: 0.9 }];
 // ---- 批量吸附计划 ----
 {
   const cuesS = [
-    { num: '1', start: 1700, end: 2800, lines: ['a'] },   // start→1600
-    { num: '2', start: 2850, end: 3000, lines: ['b'] },   // end→3200 但与第 3 条 2950 起点重叠 → 排除
+    { num: '1', start: 1700, end: 2400, lines: ['a'] },   // start→1600
+    { num: '2', start: 2500, end: 3000, lines: ['b'] },   // end→3200 但与第 3 条 2950 起点重叠 → 排除
     { num: '3', start: 2950, end: 5000, lines: ['c'] },   // start→3200（第 2 条被排除后仍用上一条原时间校验）
     { num: '4', start: 6000, end: 7000, lines: ['d'] },   // 与切点无关
   ];
@@ -779,16 +786,157 @@ const cutList = [{ time: 1600, strength: 0.8 }, { time: 3200, strength: 0.9 }];
   const planInv = Core.planCutSnap(inv, [{ time: 5000, strength: 1 }], 400, { allowOverlap: true, minDurMs: 40 });
   eq(planInv.changes.length, 0, '越过下一条整体被排除（倒序）');
   ok(planInv.skipped[0].reason.includes('倒序'), '排除原因：倒序');
-  // 顺序模拟：前一条吸附后的新终点参与后一条重叠校验
+  // 顺序模拟：前一条吸附后的新终点参与后一条校验（前条终点 1640→1600 后，
+  // 后条起点吸附到 1600 与之相接，不算重叠；若按原终点 1640 校验则会误排除）
   const seqC = [
-    { num: '1', start: 0, end: 1550, lines: ['a'] },     // end→1600
-    { num: '2', start: 1450, end: 2000, lines: ['b'] },  // start→1400 < 前条新终点 1600 → 重叠排除
+    { num: '1', start: 0, end: 1640, lines: ['a'] },     // end→1600（向后吸附）
+    { num: '2', start: 1610, end: 2100, lines: ['b'] },  // start→1600，与前条新终点相接 → 允许
   ];
-  const cuts2 = [{ time: 1400, strength: 1 }, { time: 1600, strength: 1 }];
-  const planSeq = Core.planCutSnap(seqC, cuts2, 400, { allowOverlap: false, minDurMs: 40 });
-  eq(planSeq.changes.length, 1, '顺序模拟：仅第 1 条吸附');
-  eq(planSeq.skipped.length, 1, '第 2 条因与前条新终点重叠被排除');
-  ok(planSeq.skipped[0].reason.includes('上一条'), '排除原因指向上一条');
+  const planSeq = Core.planCutSnap(seqC, [{ time: 1600, strength: 1 }], 400, { allowOverlap: false, minDurMs: 40 });
+  eq(planSeq.changes.length, 2, '顺序模拟：前条新终点参与校验，相接不重叠');
+  eq(planSeq.changes[1].newStart, 1600, '第 2 条起点吸附到切点');
+  eq(planSeq.skipped.length, 0, '相接场景无排除');
+  // 与上一条（未被吸附的）原终点重叠 → 排除
+  const ovC = [
+    { num: '1', start: 0, end: 2100, lines: ['a'] },     // 与切点无关，保持原时间
+    { num: '2', start: 1500, end: 3000, lines: ['b'] },  // start→1600 < 上一条终点 2100 → 排除
+  ];
+  const planOv2 = Core.planCutSnap(ovC, [{ time: 1600, strength: 1 }], 400, { allowOverlap: false, minDurMs: 40 });
+  eq(planOv2.changes.length, 0, '起点吸附与上一条重叠被排除');
+  eq(planOv2.skipped.length, 1, '重叠条进入排除列表');
+  ok(planOv2.skipped[0].reason.includes('上一条'), '排除原因指向上一条');
+}
+
+// ---- WebVTT 逐词时间码 ----
+{
+  const cue = {
+    num: 'c1', start: 500, end: 5000, settings: '',
+    lines: ['<v 小明><c.hi>欢迎</c><00:00:01.500>来到 &amp; <00:00:02.000>世界 hello 12345</v>'],
+  };
+  const w = Core.parseCueWords(cue);
+  eq(w.errors, [], '合法词元时间戳无错误');
+  eq(w.marks.length, 2, '解析出 2 个标记');
+  eq(w.marks[0].time, 1500, '首标记时间');
+  eq(w.marks[1].time, 2000, '次标记时间');
+  // 不可拆单元
+  const types = w.toks.map(t => t.type);
+  ok(types.includes('entity'), '实体单独成单元');
+  ok(w.toks.some(t => t.s === 'hello' && t.type === 'word'), '英文单词不拆');
+  ok(w.toks.some(t => t.s === '12345' && t.type === 'word'), '数字串不拆');
+  // 行列定位
+  ok(w.marks[0].line === 1 && w.marks[0].col > 0, '标记带行列位置');
+  // 预览 HTML 保留标签与实体
+  const pv1 = Core.cuePreviewHtml(cue, 1600).html;
+  ok(pv1.includes('vtt-voice'), '<v> 渲染为说话人 span');
+  ok(pv1.includes('vtt-class'), '<c> 渲染为类 span');
+  ok(pv1.includes('&amp;'), '实体在属性/文本中转义安全');
+  ok(/<ruby>|vtt-voice|w-active/.test(Core.cuePreviewHtml(
+    { start: 0, end: 9000, lines: ['<ruby>振<rt>zhèn</rt></ruby><00:00:02.000>动'] }, 2500).html),
+    'ruby 保留且当前词元高亮');
+  // 高亮随播放头变化
+  eq(Core.cuePreviewHtml(cue, 1600).activeTok, w.marks[0].tok, '1.6s 高亮首标记词');
+  eq(Core.cuePreviewHtml(cue, 3000).activeTok, w.marks[1].tok, '3s 高亮次标记词');
+  eq(Core.activeWord(cue, 1400), -1, '首个标记前无高亮');
+}
+// 错误定位：格式错误 / 倒序 / 越界
+{
+  const cue = {
+    num: '1', start: 1000, end: 5000,
+    lines: ['甲<00:00:02.000>乙<00:00:01.500>丙<00:00:09.000>丁 <00:99.00>戊'],
+  };
+  const w = Core.parseCueWords(cue);
+  const kinds = w.errors.map(e => e.kind);
+  ok(kinds.includes('order'), '检出顺序倒置');
+  ok(kinds.includes('outrange'), '检出超出 cue 区间');
+  ok(kinds.includes('badtime'), '检出格式错误');
+  // 每个错误都定位到行列与文本偏移
+  ok(w.errors.every(e => e.line >= 1 && e.col >= 1 && e.off >= 0), '错误带行列与偏移');
+  const order = w.errors.find(e => e.kind === 'order');
+  ok(/未严格递增/.test(order.msg), '顺序错误说明原因');
+  // 全文档分析带 cue 下标
+  const all = Core.analyzeWordTimings([cue]);
+  ok(all.length >= 3 && all.every(e => e.cue === 0), '文档级分析带 cue 下标');
+}
+// setWordTime：插入、改写、校验（绝不修改输入）
+{
+  const cue = { start: 1000, end: 5000, lines: ['甲乙丙'] };
+  const toks = Core.tokenizeCueText(cue.lines);
+  eq(toks.length, 3, '三字三单元');
+  let r = Core.setWordTime(cue, 1, 2000);
+  eq(r.error, undefined, '中间标记成功');
+  eq(r.lines[0], '甲<00:00:02.000>乙丙', '时间戳插在词前');
+  eq(cue.lines[0], '甲乙丙', '不修改输入 cue');
+  r = Core.setWordTime({ ...cue, lines: r.lines }, 0, 1500);
+  eq(r.lines[0], '<00:00:01.500>甲<00:00:02.000>乙丙', '在首词前插入');
+  // 倒序拒绝：tokens 为 甲(0) <ts>(1) 乙(2) 丙(3)；给“丙”插 1.9s（晚于标签顺序）
+  r = Core.setWordTime({ ...cue, lines: ['甲<00:00:02.000>乙丙'] }, 3, 1900);
+  ok(/严格递增/.test(r.error), '非递增拒绝：' + r.error);
+  // 越界拒绝
+  r = Core.setWordTime(cue, 0, 500);
+  ok(/字幕区间/.test(r.error), '早于 cue 起点拒绝');
+  r = Core.setWordTime(cue, 0, 5001);
+  ok(/字幕区间/.test(r.error), '晚于 cue 终点拒绝');
+  // 标签 / 空白不能标记
+  const tagged = { start: 0, end: 9000, lines: ['<i>甲</i>'] };
+  const tt = Core.tokenizeCueText(tagged.lines);
+  const tagIdx = tt.findIndex(t => t.type === 'tag');
+  ok(/不能标记/.test(Core.setWordTime(tagged, tagIdx, 1000).error), '标签不能标记');
+  // 夹在单词中的实体不能标记
+  const ent = { start: 0, end: 9000, lines: ['AT&amp;T'] };
+  const te = Core.tokenizeCueText(ent.lines);
+  const ei = te.findIndex(t => t.type === 'entity');
+  ok(/不可拆/.test(Core.setWordTime(ent, ei, 1000).error), '单词中实体不可单独标记');
+  // 改写已有标记
+  const marked = { start: 1000, end: 5000, lines: ['甲<00:00:02.000>乙'] };
+  r = Core.setWordTime(marked, Core.parseCueWords(marked).marks[0].tok, 2500);
+  eq(r.lines[0], '甲<00:00:02.500>乙', '改写已有标记');
+}
+// clearWordTime / clearAllWordTimes
+{
+  const cue = { start: 0, end: 9000, lines: ['a<00:00:01.000>b<00:00:02.000>c'] };
+  const tokB = Core.parseCueWords(cue).marks[0].tok;
+  let r = Core.clearWordTime(cue, tokB);
+  eq(r.lines[0], 'ab<00:00:02.000>c', '清除单个标记');
+  r = Core.clearAllWordTimes(cue);
+  eq(r.lines[0], 'abc', '清除全部标记');
+  ok(/没有时间戳/.test(Core.clearWordTime(cue, 0).error || ''), '无标记可清除时报错');
+}
+// 改区间：两方案规划，越界方案不可用
+{
+  const cue = { start: 1000, end: 5000, lines: ['a<00:00:02.000>b<00:00:04.500>c'] };
+  // 区间整体后移（标记仍在内部）：绝对方案可用
+  let p = Core.planWordBounds(cue, 1500, 5500);
+  eq(p.absolute.ok, true, '后移后绝对方案可用');
+  eq(p.scale.ok, true, '后移后缩放方案可用');
+  // 2000→1500+(1000/4000)*4000=2500；4500→1500+(3500/4000)*4000=5000
+  eq(p.scale.marks, [2500, 5000], '缩放映射（线性）');
+  // 起点右移到 2200：2000ms 标记越界 → 绝对不可用，缩放可用
+  p = Core.planWordBounds(cue, 2200, 5000);
+  eq(p.absolute.ok, false, '绝对方案越界被标不可用');
+  eq(p.scale.ok, true, '缩放方案仍可用');
+  ok(/落在新区间/.test(p.absolute.reason), '给出越界原因');
+  // scaleWordTimes 应用：2000→2200+1000/4000*2800=2900；4500→2200+3500/4000*2800=4650
+  const sc = Core.scaleWordTimes(cue, 2200, 5000);
+  ok(sc.lines[0].includes('<00:00:02.900>'), '缩放后首标记 2900：' + sc.lines[0]);
+  // 整块平移
+  const tr = Core.translateWordTimes(cue, 500, { start: 1500, end: 5500 });
+  eq(tr.lines[0], 'a<00:00:02.500>b<00:00:05.000>c', '平移标记 +500ms');
+  // 平移越界报错（+5000：末标记 9500 > 10000? 用更窄区间强制）
+  ok(/超出字幕区间/.test(Core.translateWordTimes(cue, 5000, { start: 6000, end: 9000 }).error),
+    '平移越界被拒');
+}
+// 导出：逐词时间码只写入 VTT
+{
+  const vtt = `WEBVTT\n\nc1\n00:00:01.000 --> 00:00:05.000\na<00:00:02.000>b\n`;
+  const doc = Core.parseSubtitle(vtt);
+  const outVtt = Core.serialize(doc, 'vtt');
+  ok(outVtt.includes('<00:00:02.000>'), 'VTT 导出含时间戳');
+  const outSrt = Core.serialize(doc, 'srt');
+  ok(!outSrt.includes('<00:'), 'SRT 导出剥离时间戳');
+  ok(outSrt.includes('ab'), 'SRT 导出保留正文');
+  // 其它标签保留
+  const doc2 = Core.parseSubtitle(`WEBVTT\n\n00:00:01.000 --> 00:00:05.000\n<i>a</i><00:00:02.000>b\n`);
+  ok(Core.serialize(doc2, 'srt').includes('<i>a</i>'), 'SRT 剥离时间戳但保留 <i>');
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

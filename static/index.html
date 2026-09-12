@@ -15,6 +15,7 @@
     <input type="file" id="fileInput" accept=".srt,.vtt,.txt" hidden>
     <button id="btnSample" title="载入内置示例字幕">载入示例</button>
     <button id="btnSampleVtt" title="载入带逐词时间码的 WebVTT 示例（无需媒体即可体验词元轨道）">VTT 逐词示例</button>
+    <button id="btnSampleLayout" title="载入带 REGION 块与 cue 布局设置的 WebVTT 示例（含故意保留的布局问题，无需媒体即可体验画面布局编辑）">VTT 布局示例</button>
   </div>
 
   <div class="group">
@@ -148,6 +149,7 @@
         <option value="text">文字变化</option>
         <option value="time">时间偏移</option>
         <option value="struct">结构（一对多/多对一）</option>
+        <option value="settings">布局差异</option>
         <option value="only">仅一侧</option>
         <option value="conflict">冲突</option>
       </select>
@@ -156,6 +158,7 @@
       <input type="checkbox" id="cmpHighOnly"> 仅高置信
     </label>
     <span id="cmpStats" class="muted grow"></span>
+    <button id="btnAdoptRegions" class="hidden" title="用对照版的 REGION 块整体替换当前文件的区域定义（可撤销）">采用对照版区域</button>
     <button id="btnBatchMerge" class="primary" title="按当前筛选，预填所有高置信度差异并生成合并预览">批量合并预览…</button>
     <button id="btnCompareClose" title="关闭对照并保留当前工作字幕（对照文件只在内存中，刷新后需重新选择）">关闭对照</button>
   </div>
@@ -236,10 +239,75 @@
   </section>
 
   <aside id="rightPane">
-    <div id="mediaBox" class="hidden" title="点击画面播放/暂停">
-      <video id="mediaVideo" playsinline preload="metadata"></video>
-      <div id="audioBadge" class="hidden">♪ <span id="audioName"></span></div>
-      <div id="nowCueOverlay"></div>
+    <div id="stageBox">
+      <div id="mediaBox" class="hidden" title="点击画面播放/暂停">
+        <video id="mediaVideo" playsinline preload="metadata"></video>
+        <div id="audioBadge" class="hidden">♪ <span id="audioName"></span></div>
+        <div id="nowCueOverlay"></div>
+      </div>
+      <div id="mockStage"><span id="mockStageLabel">模拟画面（无媒体）</span></div>
+      <svg id="layoutSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+    <div id="layoutBar">
+      <label class="chk" title="在画面上叠加播放头时刻的字幕框（WebVTT 布局预览）">
+        <input type="checkbox" id="layoutOn" checked> 布局叠加
+      </label>
+      <label title="安全区边距（画面百分比）：显式定位的字幕框越出该范围会被标出">安全边距
+        <input type="number" id="safeMargin" min="0" max="25" step="1"> %
+      </label>
+      <label id="mockAspectWrap" title="无媒体时模拟画面的宽高比">画幅
+        <select id="mockAspect">
+          <option value="16:9">16:9</option>
+          <option value="4:3">4:3</option>
+          <option value="1:1">1:1</option>
+          <option value="9:16">9:16</option>
+        </select>
+      </label>
+      <span id="layoutHint" class="muted grow"></span>
+    </div>
+    <div id="layoutPanel" class="hidden">
+      <div id="layoutPanelHead">
+        <span class="label">画面布局：</span>
+        <span id="layoutCueLabel" class="mono"></span>
+        <span id="layoutCueSrc" class="muted"></span>
+        <span class="grow"></span>
+        <button id="btnLayoutReset" class="mini" title="移除该条全部布局设置（line/position/size/align/vertical/region），恢复默认位置；未知设置保留">恢复默认</button>
+        <button id="btnLayoutBatch" class="mini accent" title="把该条的布局设置批量套用到其它字幕（先预览变更与不可用项）">套用到其它字幕…</button>
+      </div>
+      <div id="layoutForm">
+        <label title="对齐（align）">对齐
+          <select id="layAlign">
+            <option value="">默认</option>
+            <option value="start">start</option>
+            <option value="center">center</option>
+            <option value="end">end</option>
+            <option value="left">left</option>
+            <option value="right">right</option>
+          </select>
+        </label>
+        <label title="书写方向（vertical）">书写
+          <select id="layVertical">
+            <option value="">横排（默认）</option>
+            <option value="rl">竖排 rl</option>
+            <option value="lr">竖排 lr</option>
+          </select>
+        </label>
+        <label title="区域（region，来自文件中的 REGION 块）">区域
+          <select id="layRegion"><option value="">无</option></select>
+        </label>
+        <label title="line：行号或百分比，如 80% 或 -1（留空为默认）">line
+          <input id="layLine" spellcheck="false" placeholder="默认">
+        </label>
+        <label title="position：0–100%（留空按对齐取默认）">position
+          <input id="layPosition" spellcheck="false" placeholder="默认">
+        </label>
+        <label title="size：0–100%（留空为 100%）">size
+          <input id="laySize" spellcheck="false" placeholder="默认">
+        </label>
+      </div>
+      <div id="layoutErrors"></div>
+      <div id="layoutRegions" class="muted"></div>
+      <div id="layoutSrtNote" class="muted hidden">SRT 不携带布局设置：画面仅按默认位置预览，导出也不会写入布局。</div>
     </div>
     <div id="problemSummary">未载入字幕</div>
     <ul id="problemList"></ul>
@@ -421,6 +489,33 @@
     <div class="row-end">
       <button id="btnCutBatchCancel">取消</button>
       <button id="btnCutBatchApply" class="primary">应用调整</button>
+    </div>
+  </div>
+</div>
+
+<div id="layoutBatchModal" class="hidden">
+  <div id="layoutBatchBox">
+    <h3>套用布局到其它字幕 — 变更预览</h3>
+    <p class="muted" id="layoutBatchSummary"></p>
+    <div id="layoutBatchTools">
+      <button id="btnLayoutBatchAll" class="mini">全选可用项</button>
+      <button id="btnLayoutBatchNone" class="mini">全不选</button>
+    </div>
+    <div id="layoutBatchTableWrap">
+      <table id="layoutBatchTable">
+        <thead>
+          <tr><th>套用</th><th>#</th><th>当前设置</th><th>套用后</th><th>状态</th></tr>
+        </thead>
+        <tbody id="layoutBatchTbody"></tbody>
+      </table>
+    </div>
+    <p class="muted" id="layoutBatchNote">
+      套用会替换目标字幕的 line/position/size/align/vertical/region 设置（源中未设置的键被移除），
+      未知设置与原有顺序保留；应用后可用 Ctrl+Z 整体撤销。
+    </p>
+    <div class="row-end">
+      <button id="btnLayoutBatchCancel">取消</button>
+      <button id="btnLayoutBatchApply" class="primary">应用套用</button>
     </div>
   </div>
 </div>

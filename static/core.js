@@ -70,24 +70,30 @@
     return { num: num, start: start, end: end, settings: settings, lines: blockLines.slice(timeIdx + 1) };
   }
 
-  // 解析整个文件 → { format, header, cues:[{num,start,end,settings,lines}] }
+  // 解析整个文件 → { format, header, regions:[{raw,settings,id,errors}], cues:[{num,start,end,settings,lines}] }
   function parseSubtitle(text) {
     const format = detectFormat(text);
     const all = String(text).replace(/\r\n?/g, NL).split(NL);
-    const doc = { format: format, header: '', cues: [] };
+    const doc = { format: format, header: '', regions: [], cues: [] };
     let i = 0;
     if (format === 'vtt') {
-      // 头部：WEBVTT 行及其后到首个空行之间的元数据，原样保留
+      // 头部：WEBVTT 行及其后到首个空行之间的元数据，原样保留；
+      // 头部未以空行结束就直接出现 REGION 块时，从 REGION 行起按正文处理
       const headerLines = [];
-      while (i < all.length && all[i].trim() !== '') { headerLines.push(all[i]); i++; }
+      while (i < all.length && all[i].trim() !== '' && all[i].trim() !== 'REGION') { headerLines.push(all[i]); i++; }
       doc.header = headerLines.join(NL) || 'WEBVTT';
       while (i < all.length && all[i].trim() === '') i++;
     }
     let block = [];
     function flush() {
       if (block.length) {
-        const cue = parseBlock(block);
-        if (cue) doc.cues.push(cue);
+        // REGION 块（WebVTT 区域定义）单独解析并保留原文，不参与 cue 解析
+        if (format === 'vtt' && block[0].trim() === 'REGION') {
+          doc.regions.push(parseRegionBlock(block));
+        } else {
+          const cue = parseBlock(block);
+          if (cue) doc.cues.push(cue);
+        }
         block = [];
       }
     }
@@ -119,7 +125,12 @@
     });
     if (format === 'vtt') {
       const header = (doc.header && doc.header.trim()) ? doc.header.trim() : 'WEBVTT';
-      return header + NL + NL + blocks.join(NL + NL) + NL;
+      // REGION 块随头部之后原样输出（保留未知设置与原有顺序）
+      const regionBlocks = (doc.regions || []).map(function (r) {
+        return r && r.raw ? r.raw.trim() : '';
+      }).filter(Boolean);
+      const parts = [header].concat(regionBlocks, blocks);
+      return parts.join(NL + NL) + NL;
     }
     return blocks.join(NL + NL) + NL;
   }
@@ -908,6 +919,9 @@
       e.timeChanged = e.alen === 1 && e.blen === 1
         ? (Math.abs(e.dStart) > 1 || Math.abs(e.dEnd) > 1)
         : (ga.start !== gb.start || ga.end !== gb.end);
+      // cue 布局设置（line/position/size/align/vertical/region 原文）差异：仅一对一比较
+      e.settingsChanged = e.alen === 1 && e.blen === 1 &&
+        (cuesA[e.ai].settings || '') !== (cuesB[e.bj].settings || '');
       e.conflict = false;
       e.reasons = [];
       if (e.score < cfg.CONF_MIN) {
@@ -1156,9 +1170,11 @@
         var r = ref[e.bj];
         res.time = timeOrderError(cur, e.ai, r.start, r.end);
         res.full = res.time || (effectiveLength(r.lines.join('\n')) === 0 ? '对照文本为空' : null);
+        res.settings = null;
       } else {
         res.time = '结构不同（' + e.alen + ' ↔ ' + e.blen + '），请使用整组采用';
         res.full = res.time;
+        res.settings = '结构不同（' + e.alen + ' ↔ ' + e.blen + '），布局采用仅支持一对一';
       }
       res.group = null;
       var rg = replaceGroup(cur, e.ai, e.alen, ref, e.bj, e.blen, 'srt');
@@ -1275,6 +1291,9 @@
         if (mode === 'text') {
           if (e.alen !== 1 || e.blen !== 1) { fail(idx, mode, '仅一对一可采用文本'); return; }
           res = adoptText(w, at, refCues[e.bj].lines);
+        } else if (mode === 'settings') {
+          if (e.alen !== 1 || e.blen !== 1) { fail(idx, mode, '仅一对一可采用布局设置'); return; }
+          res = adoptSettings(w, at, refCues[e.bj].settings || '');
         } else if (mode === 'time' || mode === 'full') {
           if (e.alen !== 1 || e.blen !== 1) {
             fail(idx, mode, '结构不同请使用整组采用'); return;
@@ -1912,6 +1931,424 @@
     return { html: html, activeTok: active };
   }
 
+  // ---------- WebVTT 画面布局（cue settings 与 REGION 块） ----------
+  //
+  // cue.settings 始终是原始字符串（未知设置与原有顺序原样保留，导出时回写）；
+  // doc.regions 保留 REGION 块原文。以下函数负责解析 / 校验 / 布局计算 / 编辑改写，
+  // 导入内容只报告问题，绝不擅自改写。
+
+  var LAYOUT_KEYS = ['line', 'position', 'size', 'align', 'vertical', 'region'];
+  var LINE_HEIGHT_PCT = 5.5;   // 预览估算：一行字幕约占画面高度的 5.5%
+
+  // "50%" → 50；否则 null
+  function parsePct(v) {
+    var m = /^(-?\d+(?:\.\d+)?)%$/.exec(String(v).trim());
+    return m ? parseFloat(m[1]) : null;
+  }
+
+  // "10%,90%" → {x:10, y:90}；否则 null
+  function parseAnchorValue(v) {
+    var m = /^\s*(-?\d+(?:\.\d+)?)%,\s*(-?\d+(?:\.\d+)?)%\s*$/.exec(String(v));
+    return m ? { x: parseFloat(m[1]), y: parseFloat(m[2]) } : null;
+  }
+
+  // line 值："80%" / "80%,center" / "-1" / "-1,end" → {v, pct, align}；非法 null
+  function parseLineValue(v) {
+    var m = /^(-?\d+(?:\.\d+)?)(%)?(?:,(start|center|end))?$/.exec(String(v).trim());
+    if (!m) return null;
+    return { v: parseFloat(m[1]), pct: !!m[2], align: m[3] || 'start' };
+  }
+
+  // 单个 cue 设置值校验：返回错误文案或 null（未知键不校验，原样保留）
+  function validateCueSetting(key, value) {
+    switch (key) {
+      case 'line': {
+        var p = parseLineValue(value);
+        if (!p) return 'line 值「' + value + '」无法识别（应为行号或 0–100%，可带 ,start/,center/,end）';
+        if (p.pct && (p.v < 0 || p.v > 100)) return 'line 百分比「' + value + '」越界（0–100%）';
+        return null;
+      }
+      case 'position': {
+        var m = /^(-?\d+(?:\.\d+)?)%(?:,(line-left|line-right|center|start|end))?$/.exec(String(value).trim());
+        if (!m) return 'position 值「' + value + '」无法识别（应为 0–100%，可带 ,line-left/,line-right/,center/,start/,end）';
+        var pv = parseFloat(m[1]);
+        if (pv < 0 || pv > 100) return 'position「' + value + '」越界（0–100%）';
+        return null;
+      }
+      case 'size': {
+        var sv = parsePct(value);
+        if (sv === null) return 'size 值「' + value + '」无法识别（应为 0–100%）';
+        if (sv < 0 || sv > 100) return 'size「' + value + '」越界（0–100%）';
+        return null;
+      }
+      case 'align':
+        return /^(start|center|end|left|right)$/.test(value) ? null
+          : 'align 值「' + value + '」无法识别（start/center/end/left/right）';
+      case 'vertical':
+        return /^(rl|lr)$/.test(value) ? null : 'vertical 值「' + value + '」无法识别（rl/lr）';
+      case 'region':
+        return value ? null : 'region 缺少区域标识';
+      default:
+        return null;   // 未知设置：原样保留，不校验
+    }
+  }
+
+  // 解析 cue settings 字符串 → { tokens:[{key,value,raw}]（顺序保留）, errors:[{kind,key,raw,msg}] }
+  // 只报告问题（badform/dup/range），不改写任何内容。
+  function parseCueSettings(settings) {
+    var tokens = [], errors = [], seen = {};
+    String(settings || '').split(/\s+/).forEach(function (part) {
+      if (!part) return;
+      var ci = part.indexOf(':');
+      if (ci <= 0) {
+        errors.push({ kind: 'badform', key: '', raw: part,
+          msg: '无法识别的设置「' + part + '」（应为 键:值 形式）' });
+        tokens.push({ key: '', value: part, raw: part });
+        return;
+      }
+      var key = part.slice(0, ci), value = part.slice(ci + 1);
+      if (seen[key] !== undefined) {
+        errors.push({ kind: 'dup', key: key, raw: part,
+          msg: '设置「' + key + '」重复出现（「' + part + '」与先前的「' + key + ':' + seen[key] + '」）' });
+      } else {
+        seen[key] = value;
+      }
+      tokens.push({ key: key, value: value, raw: part });
+      var verr = validateCueSetting(key, value);
+      if (verr) errors.push({ kind: 'range', key: key, raw: part, msg: verr });
+    });
+    return { tokens: tokens, errors: errors };
+  }
+
+  // tokens → {key: value}（重复键取第一个，与浏览器行为一致）
+  function tokenMap(tokens) {
+    var map = {};
+    tokens.forEach(function (t) {
+      if (t.key && map[t.key] === undefined) map[t.key] = t.value;
+    });
+    return map;
+  }
+
+  // 单个区域设置值校验：返回错误文案或 null（未知键不校验）
+  function validateRegionSetting(key, value) {
+    switch (key) {
+      case 'id':
+        return value ? null : '区域 id 不能为空';
+      case 'width': {
+        var w = parsePct(value);
+        if (w === null || w < 0 || w > 100) return '区域 width「' + value + '」越界（0–100%）';
+        return null;
+      }
+      case 'lines':
+        return /^\d+$/.test(value) ? null : '区域 lines「' + value + '」应为非负整数';
+      case 'regionanchor':
+      case 'viewportanchor': {
+        var a = parseAnchorValue(value);
+        if (!a) return '区域 ' + key + '「' + value + '」应为 x%,y% 形式';
+        if (a.x < 0 || a.x > 100 || a.y < 0 || a.y > 100) {
+          return '区域 ' + key + '「' + value + '」越界（0–100%）';
+        }
+        return null;
+      }
+      case 'scroll':
+        return (value === '' || value === 'up') ? null : '区域 scroll「' + value + '」无法识别（仅支持 up）';
+      default:
+        return null;
+    }
+  }
+
+  // 解析 REGION 块（首行已是 REGION）→ {raw, settings:[{key,value,raw}], id, errors}
+  function parseRegionBlock(lines) {
+    var settings = [], errors = [], seen = {};
+    for (var k = 1; k < lines.length; k++) {
+      var line = lines[k];
+      if (!line.trim()) continue;
+      var ci = line.indexOf(':');
+      if (ci <= 0) {
+        errors.push({ kind: 'badform', key: '', raw: line,
+          msg: '无法识别的区域设置「' + line.trim() + '」（应为 键:值 形式）' });
+        settings.push({ key: '', value: line.trim(), raw: line });
+        continue;
+      }
+      var key = line.slice(0, ci).trim(), value = line.slice(ci + 1).trim();
+      if (seen[key] !== undefined) {
+        errors.push({ kind: 'dup', key: key, raw: line,
+          msg: '区域设置「' + key + '」重复出现（「' + value + '」与先前的「' + seen[key] + '」）' });
+      } else {
+        seen[key] = value;
+      }
+      settings.push({ key: key, value: value, raw: line });
+      var verr = validateRegionSetting(key, value);
+      if (verr) errors.push({ kind: 'range', key: key, raw: line, msg: verr });
+    }
+    var id = '';
+    settings.forEach(function (t) { if (t.key === 'id' && !id) id = t.value; });
+    return { raw: lines.join(NL), settings: settings, id: id, errors: errors };
+  }
+
+  // 单条 cue 的布局设置校验（含区域存在性与组合冲突），返回问题列表。
+  // 所有问题都定位到具体字幕（cue 下标），且绝不擅自改写。
+  function analyzeCueSettings(doc, i) {
+    var cue = doc.cues[i];
+    var p = parseCueSettings(cue.settings);
+    var errs = [];
+    p.errors.forEach(function (e) {
+      errs.push({ cue: i, type: 'layout', kind: e.kind, msg: e.msg + '，未擅自改写' });
+    });
+    var map = tokenMap(p.tokens);
+    if (map.region !== undefined) {
+      var rid = map.region, found = false;
+      (doc.regions || []).forEach(function (r) { if (r.id && r.id === rid) found = true; });
+      if (!found) {
+        errs.push({ cue: i, type: 'layout', kind: 'noregion',
+          msg: '引用的区域「' + rid + '」在 REGION 块中不存在，未擅自改写' });
+      }
+      // 组合冲突：区域字幕的 line/position/size 按规范会被忽略
+      ['line', 'position', 'size'].forEach(function (k) {
+        if (map[k] !== undefined) {
+          errs.push({ cue: i, type: 'layout', kind: 'combo',
+            msg: 'region 与 ' + k + ' 同时设置：按规范区域字幕将忽略 ' + k + '，未擅自改写' });
+        }
+      });
+    }
+    return errs;
+  }
+
+  function analyzeLayoutSettings(doc) {
+    var out = [];
+    if (!doc || doc.format !== 'vtt') return out;
+    doc.cues.forEach(function (_, i) { out = out.concat(analyzeCueSettings(doc, i)); });
+    return out;
+  }
+
+  // ---------- 布局计算（预览近似：全部按画面百分比） ----------
+
+  function defaultPositionForAlign(align) {
+    if (align === 'start' || align === 'left') return 0;
+    if (align === 'end' || align === 'right') return 100;
+    return 50;
+  }
+  function alignOffset(align, len) {
+    if (align === 'center') return len / 2;
+    if (align === 'end' || align === 'right') return len;
+    return 0;
+  }
+
+  // 计算一条 cue 在画面上的字幕框（百分比坐标）。
+  // opts: { regions, lineHeightPct }
+  // 返回 { x, y, w, h, vertical, align, region, source:'region'|'cue'|'default' }
+  function computeCueBox(cue, opts) {
+    opts = opts || {};
+    var lh = opts.lineHeightPct || LINE_HEIGHT_PCT;
+    var p = parseCueSettings(cue.settings);
+    var map = tokenMap(p.tokens);
+    var nLines = Math.max(1, (cue.lines || []).length);
+    var vertical = (map.vertical === 'rl' || map.vertical === 'lr') ? map.vertical : null;
+    var align = map.align || 'center';
+    var explicit = false;
+    LAYOUT_KEYS.forEach(function (k) { if (map[k] !== undefined) explicit = true; });
+    // 区域字幕：位置由 REGION 定义决定（cue 上的 line/position/size 被忽略）
+    if (map.region !== undefined) {
+      var region = null;
+      (opts.regions || []).forEach(function (r) { if (r.id && r.id === map.region) region = r; });
+      if (region) {
+        var rm = tokenMap(region.settings);
+        var rw = rm.width !== undefined ? parsePct(rm.width) : 100;
+        if (rw === null) rw = 100;
+        var rlines = (rm.lines !== undefined && /^\d+$/.test(rm.lines)) ? parseInt(rm.lines, 10) : 3;
+        var va = parseAnchorValue(rm.viewportanchor || '') || { x: 0, y: 100 };
+        var ra = parseAnchorValue(rm.regionanchor || '') || { x: 0, y: 100 };
+        var w2 = rw, h2 = Math.max(1, rlines) * lh;
+        return {
+          x: va.x - ra.x / 100 * w2, y: va.y - ra.y / 100 * h2,
+          w: w2, h: h2, vertical: vertical, align: align,
+          region: region.id, source: 'region',
+        };
+      }
+      // 区域不存在：按默认位置预览（错误由 analyzeCueSettings 报告）
+    }
+    var size = map.size !== undefined ? parsePct(map.size) : 100;
+    if (size === null) size = 100;
+    var pos = map.position !== undefined ? parsePct(map.position) : null;
+    if (pos === null) pos = defaultPositionForAlign(align);
+    var line = map.line !== undefined ? parseLineValue(map.line) : null;
+    if (!vertical) {
+      var w = size, h = nLines * lh;
+      var x = pos - alignOffset(align, w);
+      var y;
+      if (!line) y = 100 - h;                 // 默认贴底
+      else if (line.pct) y = line.v - alignOffset(line.align, h);
+      else y = line.v >= 0 ? line.v * lh : 100 - h + (line.v + 1) * lh;   // 行号（负值自底部数）
+      return { x: x, y: y, w: w, h: h, vertical: null, align: align,
+        region: null, source: explicit ? 'cue' : 'default' };
+    }
+    // 竖排：size 为高度，position 为纵向锚点，line 为横向锚点
+    var h3 = size, w3 = nLines * lh;
+    var y3 = pos - alignOffset(align, h3);
+    var x3;
+    if (!line) x3 = vertical === 'rl' ? 100 - w3 : 0;   // rl 默认靠右，lr 默认靠左
+    else if (line.pct) x3 = line.v - alignOffset(line.align, w3);
+    else x3 = line.v >= 0 ? line.v * lh : 100 - w3 + (line.v + 1) * lh;
+    return { x: x3, y: y3, w: w3, h: h3, vertical: vertical, align: align,
+      region: null, source: explicit ? 'cue' : 'default' };
+  }
+
+  // 百分比数值 → "50%"（保留一位小数，去掉多余的 .0）
+  function fmtPct(v) {
+    var r = Math.round(v * 10) / 10;
+    return (Math.abs(r - Math.round(r)) < 0.001 ? String(Math.round(r)) : String(r)) + '%';
+  }
+
+  // 由字幕框反推 line/position/size 更新值（拖动 / 缩放时调用，不修改输入）。
+  // 锚点换算遵循 computeCueBox 的同一套规则：position 按 align 锚定，
+  // line 写成百分比形式并沿用原有 line 对齐（无则按 start）。
+  function boxToSettings(cue, box) {
+    var p = parseCueSettings(cue.settings);
+    var map = tokenMap(p.tokens);
+    var align = map.align || 'center';
+    var vertical = (map.vertical === 'rl' || map.vertical === 'lr') ? map.vertical : null;
+    var line = map.line !== undefined ? parseLineValue(map.line) : null;
+    var la = line ? line.align : 'start';
+    var updates = {};
+    if (!vertical) {
+      updates.size = fmtPct(box.w);
+      updates.position = fmtPct(box.x + alignOffset(align, box.w));
+      updates.line = fmtPct(box.y + alignOffset(la, box.h));
+    } else {
+      updates.size = fmtPct(box.h);
+      updates.position = fmtPct(box.y + alignOffset(align, box.h));
+      updates.line = fmtPct(box.x + alignOffset(la, box.w));
+    }
+    return updates;
+  }
+
+  // 把 updates（{key: 新值|null}，null 表示移除该键）写回 settings 字符串：
+  // 已涉及的键原位替换或删除，新键按规范顺序追加；未知设置与原有顺序原样保留。
+  function applyLayoutUpdates(settings, updates) {
+    var p = parseCueSettings(settings);
+    var done = {};
+    var out = [];
+    p.tokens.forEach(function (t) {
+      if (t.key && Object.prototype.hasOwnProperty.call(updates, t.key)) {
+        if (updates[t.key] !== null && updates[t.key] !== undefined && updates[t.key] !== '') {
+          out.push(t.key + ':' + updates[t.key]);
+        }
+        done[t.key] = true;
+      } else {
+        out.push(t.raw);
+      }
+    });
+    LAYOUT_KEYS.forEach(function (k) {
+      if (done[k]) return;
+      var v = updates[k];
+      if (v !== null && v !== undefined && v !== '') out.push(k + ':' + v);
+    });
+    return out.join(' ');
+  }
+
+  // ---------- 同时刻布局冲突（安全区 / 遮挡 / 书写方向） ----------
+
+  // opts: { safePct }（安全边距，画面百分比，默认 5）
+  // 返回 [{cue, type:'lay-safe'|'lay-occlude'|'lay-vmode', msg, other?}]
+  // 默认位置的字幕由播放器自动堆叠，不参与安全区与遮挡检查；SRT 不检查。
+  function analyzeLayoutConflicts(doc, opts) {
+    opts = opts || {};
+    var safe = opts.safePct === undefined ? 5 : opts.safePct;
+    var probs = [];
+    if (!doc || doc.format !== 'vtt') return probs;
+    var boxes = doc.cues.map(function (c) { return computeCueBox(c, { regions: doc.regions }); });
+    var EPS = 0.05;
+    doc.cues.forEach(function (c, i) {
+      var b = boxes[i];
+      if (b.source === 'default') return;
+      var out = [];
+      if (b.x < safe - EPS) out.push('左');
+      if (b.y < safe - EPS) out.push('上');
+      if (b.x + b.w > 100 - safe + EPS) out.push('右');
+      if (b.y + b.h > 100 - safe + EPS) out.push('下');
+      if (out.length) {
+        probs.push({ cue: i, type: 'lay-safe',
+          msg: '字幕框' + out.join('、') + '侧越出安全区（边距 ' + safe + '%）' });
+      }
+    });
+    for (var i = 0; i < doc.cues.length; i++) {
+      for (var j = i + 1; j < doc.cues.length; j++) {
+        var a = doc.cues[i], b2 = doc.cues[j];
+        if (a.start >= b2.end || b2.start >= a.end) continue;   // 不同时出现
+        var ba = boxes[i], bb = boxes[j];
+        if (ba.source !== 'default' || bb.source !== 'default') {
+          var ov = ba.x < bb.x + bb.w - EPS && bb.x < ba.x + ba.w - EPS &&
+                   ba.y < bb.y + bb.h - EPS && bb.y < ba.y + ba.h - EPS;
+          if (ov) {
+            probs.push({ cue: j, type: 'lay-occlude', other: i,
+              msg: '与第 ' + (a.num || (i + 1)) + ' 条同时出现且字幕框相互遮挡' });
+          }
+        }
+        var va = ba.vertical, vb = bb.vertical;
+        if (!!va !== !!vb || (va && vb && va !== vb)) {
+          probs.push({ cue: j, type: 'lay-vmode', other: i,
+            msg: '与第 ' + (a.num || (i + 1)) + ' 条同时出现，书写方向冲突（' +
+              (va ? '竖排 ' + va : '横排') + ' ↔ ' + (vb ? '竖排 ' + vb : '横排') + '）' });
+        }
+      }
+    }
+    return probs;
+  }
+
+  // ---------- 布局批量套用 ----------
+
+  // 把第 srcIdx 条的布局键（line/position/size/align/vertical/region）套用到目标字幕：
+  // 目标未出现在源中的布局键被移除，未知设置与原有顺序保留。不修改原数据。
+  // 返回 [{i, num, oldSettings, newSettings, changed, error?}]；
+  // 源布局自身含错误、或引用的区域不存在时，所有目标标记为不可用并说明原因。
+  function planLayoutApply(doc, srcIdx, targetIdxs) {
+    var src = doc.cues[srcIdx];
+    var sp = parseCueSettings(src.settings);
+    var srcMap = tokenMap(sp.tokens);
+    var items = [];
+    (targetIdxs || []).forEach(function (i) {
+      var cue = doc.cues[i];
+      var item = { i: i, num: cue.num || String(i + 1), oldSettings: cue.settings || '' };
+      if (i === srcIdx) {
+        item.error = '源字幕自身，无需套用';
+        items.push(item);
+        return;
+      }
+      if (sp.errors.length) {
+        item.error = '源布局含错误（' + sp.errors[0].msg + '），请先修正后再套用';
+        items.push(item);
+        return;
+      }
+      if (srcMap.region !== undefined) {
+        var found = false;
+        (doc.regions || []).forEach(function (r) { if (r.id && r.id === srcMap.region) found = true; });
+        if (!found) {
+          item.error = '源布局引用的区域「' + srcMap.region + '」不存在，无法套用';
+          items.push(item);
+          return;
+        }
+      }
+      var updates = {};
+      LAYOUT_KEYS.forEach(function (k) {
+        updates[k] = srcMap[k] !== undefined ? srcMap[k] : null;
+      });
+      item.newSettings = applyLayoutUpdates(cue.settings, updates);
+      item.changed = item.newSettings !== (cue.settings || '');
+      items.push(item);
+    });
+    return items;
+  }
+
+  // ---------- 版本对照：采用布局设置 ----------
+
+  // 单条采用对照版 cue settings 原文（时间与文本不动）。返回 {cues} 或 {error}。
+  function adoptSettings(cues, at, settingsStr) {
+    if (!Array.isArray(cues) || at < 0 || at >= cues.length) return { error: '指定的字幕不存在' };
+    var out = cues.map(cloneCue);
+    out[at].settings = settingsStr || '';
+    return { cues: out };
+  }
+
   // ---------- 草稿键 ----------
 
   // FNV-1a 简易哈希，用于生成草稿键
@@ -1957,6 +2394,16 @@
     translateWordTimes: translateWordTimes, rewriteWordTimes: rewriteWordTimes,
     stripWordTimestamps: stripWordTimestamps, cuePreviewHtml: cuePreviewHtml,
     activeWord: activeWord, decodeEntity: decodeEntity,
+    // WebVTT 画面布局
+    parseCueSettings: parseCueSettings, validateCueSetting: validateCueSetting,
+    parseRegionBlock: parseRegionBlock, validateRegionSetting: validateRegionSetting,
+    tokenMap: tokenMap, parsePct: parsePct, parseLineValue: parseLineValue,
+    parseAnchorValue: parseAnchorValue, fmtPct: fmtPct,
+    analyzeCueSettings: analyzeCueSettings, analyzeLayoutSettings: analyzeLayoutSettings,
+    computeCueBox: computeCueBox, boxToSettings: boxToSettings,
+    applyLayoutUpdates: applyLayoutUpdates, analyzeLayoutConflicts: analyzeLayoutConflicts,
+    planLayoutApply: planLayoutApply, adoptSettings: adoptSettings,
+    LAYOUT_KEYS: LAYOUT_KEYS, LINE_HEIGHT_PCT: LINE_HEIGHT_PCT,
     simpleHash: simpleHash, draftKey: draftKey,
   };
 });
